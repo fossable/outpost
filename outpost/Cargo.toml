@@ -1,0 +1,11 @@
+[package]
+authors = ["Tyler Cook"]
+description = "A command-line application for managing outpost"
+edition = "2021"
+license = "AGPL-3.0-only"
+name = "outpost"
+repository = "https://github.com/fossable/outpost"
+rust-version = "1.74"
+version = "0.0.1"
+
+[dependencies]
