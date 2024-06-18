@@ -14,15 +14,24 @@ popular cloud providers.
 ### Example with docker-compose
 
 ```yml
-version: '3.8'
+name: example.com
 
 services:
   outpost:
     image: fossable/outpost:latest
     depends_on:
       - www
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    volumes:
+      - /lib/modules:/lib/modules
+    ports:
+      - 51820:51820/udp
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+
   www:
-    build:
-      context: www
+    image: apache:latest
 ```
 

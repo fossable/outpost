@@ -1,4 +1,5 @@
 use anyhow::Result;
+use outpost::PortMapping;
 use serde::Serialize;
 use std::process::{Child, Command};
 use tracing::instrument;
@@ -26,7 +27,7 @@ pub struct CloudflareProxy {
 
 impl CloudflareProxy {
     #[instrument(ret)]
-    pub fn new() -> Result<Self> {
+    pub fn new(ports: Vec<PortMapping>) -> Result<Self> {
         let temp = tempfile::TempDir::new()?;
 
         // Generate config

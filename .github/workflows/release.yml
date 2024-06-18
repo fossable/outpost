@@ -58,6 +58,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           for tag in $(git tag --points-at HEAD); do
+            tag="outpost-${tag}"
             if cp target/${{ matrix.target }}/release/${tag%-*} ${tag%-*}_${{ matrix.target }}; then
               gh release upload "${tag}" "${tag%-*}_${{ matrix.target }}"
             fi
@@ -84,6 +85,7 @@ jobs:
         id: get_tags
         run: |
           for tag in $(git tag --points-at HEAD); do
+            tag="outpost-${tag}"
             echo "${tag%-*}=${tag##*-}" >>"$GITHUB_OUTPUT"
           done
 
