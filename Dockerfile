@@ -13,7 +13,7 @@ ARG BUILDARCH
 RUN apk add --no-cache curl
 
 # Install cloudflared
-RUN curl -o /usr/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/download/2024.6.0/cloudflared-linux-${BUILDARCH}" && chmod +x /usr/bin/cloudflared
+RUN curl -L -o /usr/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/download/2024.6.1/cloudflared-linux-amd64" && chmod +x /usr/bin/cloudflared
 
 # Install AWS SDK
 # TODO

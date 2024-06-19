@@ -6,6 +6,18 @@ pub struct PortMapping {
     pub public: u16,
 }
 
+impl PortMapping {
+    pub fn from_vec(p: Vec<String>) -> Result<Vec<Self>> {
+        let mut ports = Vec::new();
+
+        for mapping in p.into_iter() {
+            ports.push(mapping.try_into()?);
+        }
+
+        Ok(ports)
+    }
+}
+
 impl TryFrom<String> for PortMapping {
     type Error = anyhow::Error;
 

@@ -4,6 +4,7 @@ use serde::Deserialize;
 #[serde(tag = "provider")]
 pub enum ServiceConfig {
     #[cfg(feature = "cloudflare")]
+    #[serde(rename = "cloudflare")]
     Cloudflare {
         cert_path: String,
 

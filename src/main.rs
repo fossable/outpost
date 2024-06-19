@@ -31,8 +31,8 @@ async fn main() -> Result<ExitCode> {
         match service_config {
             #[cfg(feature = "cloudflare")]
             ServiceConfig::Cloudflare { cert_path, ports } => {
-                let ports: Vec<PortMapping> = todo!();
-                tokio::spawn(async { crate::cloudflare::CloudflareProxy::new(ports) });
+                let ports: Vec<PortMapping> = PortMapping::from_vec(ports)?;
+                tokio::spawn(async { crate::cloudflare::CloudflareProxy::new(hostname, ports) });
             }
         }
     }
