@@ -27,12 +27,18 @@ async fn main() -> Result<ExitCode> {
         &std::env::var("OUTPOST_CONFIG").context("get config from environment")?,
     )?;
 
-    for (hostname, service_config) in config.into_iter() {
+    for (fqdn, service_config) in config.into_iter() {
         match service_config {
             #[cfg(feature = "cloudflare")]
-            ServiceConfig::Cloudflare { cert_path, ports } => {
+            ServiceConfig::Cloudflare {
+                service,
+                cert_path,
+                ports,
+            } => {
                 let ports: Vec<PortMapping> = PortMapping::from_vec(ports)?;
-                tokio::spawn(async { crate::cloudflare::CloudflareProxy::new(hostname, ports) });
+                tokio::spawn(async {
+                    crate::cloudflare::CloudflareProxy::new(service, fqdn, ports)
+                });
             }
         }
     }

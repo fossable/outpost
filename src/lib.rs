@@ -11,7 +11,12 @@ impl PortMapping {
         let mut ports = Vec::new();
 
         for mapping in p.into_iter() {
-            ports.push(mapping.try_into()?);
+            let mapping = mapping.try_into()?;
+
+            // Check for duplicates
+            // TODO
+
+            ports.push(mapping);
         }
 
         Ok(ports)

@@ -14,7 +14,7 @@ popular cloud providers.
 ### Example with docker-compose
 
 ```yml
-name: example.com
+name: example_com
 
 services:
   outpost:
@@ -30,8 +30,17 @@ services:
       - 51820:51820/udp
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
+    environment:
+      OUTPOST_CONFIG: |
+        {
+          "www.example.com": {
+            "service": "www",
+            "provider": "cloudflare",
+            "ports": ["80:443"]
+          }
+        }
 
   www:
-    image: apache:latest
+    image: httpd:latest
 ```
 
