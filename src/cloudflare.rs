@@ -1,13 +1,9 @@
 use anyhow::Result;
 use outpost::PortMapping;
 use serde::Serialize;
-use std::{
-    process::{Child, Command},
-    time::Duration,
-};
 use tempfile::TempDir;
+use tokio::process::{Child, Command};
 use tracing::{debug, info, instrument};
-use uuid::Uuid;
 
 #[derive(Debug, Serialize)]
 pub struct CloudflareConfigIngress {
@@ -27,24 +23,63 @@ pub struct CloudflareConfig {
 
 #[derive(Debug)]
 pub struct CloudflareProxy {
-    temp: TempDir,
+    _temp: TempDir,
     /// The cloudflared child process which actually handles the routing
     pub process: Child,
 }
 
+impl Drop for CloudflareProxy {
+    fn drop(&mut self) {
+        debug!("Stopping cloudflare tunnel");
+        futures::executor::block_on(self.process.kill()).unwrap();
+    }
+}
+
 impl CloudflareProxy {
     #[instrument(ret)]
-    pub fn new(service: String, fqdn: String, ports: Vec<PortMapping>) -> Result<Self> {
+    pub async fn new(service: String, fqdn: String, ports: Vec<PortMapping>) -> Result<Self> {
         let temp = TempDir::new()?;
+
+        // Make sure the tunnel doesn't already exist
+        if Command::new("cloudflared")
+            .arg("tunnel")
+            .arg("delete")
+            .arg(&service)
+            .spawn()?
+            .wait()
+            .await?
+            .success()
+        {
+            debug!("Deleted existing tunnel successfully");
+        }
+
+        // Create tunnel
+        assert!(Command::new("cloudflared")
+            .arg("tunnel")
+            .arg("create")
+            .arg(&service)
+            .spawn()?
+            .wait()
+            .await?
+            .success());
+
+        // Update DNS record
+        assert!(Command::new("cloudflared")
+            .arg("tunnel")
+            .arg("route")
+            .arg("dns")
+            .arg("--overwrite-dns")
+            .arg(&service)
+            .arg(&fqdn)
+            .spawn()?
+            .wait()
+            .await?
+            .success());
 
         // Generate config
         let mut config = CloudflareConfig {
-            tunnel: Uuid::new_v4().to_string(),
-            credentials_file: temp
-                .path()
-                .join(format!("{}.json", &fqdn))
-                .to_string_lossy()
-                .to_string(),
+            tunnel: "".to_string(),
+            credentials_file: "".to_string(),
             ingress: vec![
                 // This one is always required to be last
                 CloudflareConfigIngress {
@@ -53,6 +88,26 @@ impl CloudflareProxy {
                 },
             ],
         };
+
+        // Find tunnel secret file rather than parsing command output
+        for entry in std::fs::read_dir("/root/.cloudflared")? {
+            let entry = entry?;
+
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .to_owned()
+                .ends_with(".json")
+            {
+                config.tunnel = entry
+                    .path()
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                config.credentials_file = entry.path().to_string_lossy().to_string();
+            }
+        }
 
         for port in ports {
             config.ingress.insert(
@@ -70,48 +125,9 @@ impl CloudflareProxy {
         let config_path = temp.path().join("config.yml");
         std::fs::write(&config_path, serde_yaml::to_string(&config)?)?;
 
-        // Make sure the tunnel doesn't already exist
-        if Command::new("cloudflared")
-            .arg("tunnel")
-            .arg("--config")
-            .arg(config_path.to_string_lossy().to_string())
-            .arg("delete")
-            .arg(&service)
-            .spawn()?
-            .wait()?
-            .success()
-        {
-            debug!("Deleted existing tunnel successfully");
-        }
-
-        // Create tunnel
-        assert!(Command::new("cloudflared")
-            .arg("tunnel")
-            .arg("--config")
-            .arg(config_path.to_string_lossy().to_string())
-            .arg("create")
-            .arg(&service)
-            .spawn()?
-            .wait()?
-            .success());
-
-        // Update DNS record
-        assert!(Command::new("cloudflared")
-            .arg("tunnel")
-            .arg("--config")
-            .arg(config_path.to_string_lossy().to_string())
-            .arg("route")
-            .arg("dns")
-            .arg("--overwrite-dns")
-            .arg(&service)
-            .arg(fqdn)
-            .spawn()?
-            .wait()?
-            .success());
-
         info!("Starting cloudflare tunnel");
         Ok(Self {
-            temp,
+            _temp: temp,
             process: Command::new("cloudflared")
                 // Try to not cede any more control to cloudflare
                 .arg("--no-autoupdate")

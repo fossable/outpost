@@ -38,6 +38,12 @@ async fn main() -> Result<ExitCode> {
                 let ports: Vec<PortMapping> = PortMapping::from_vec(ports)?;
                 tokio::spawn(async {
                     crate::cloudflare::CloudflareProxy::new(service, fqdn, ports)
+                        .await
+                        .unwrap()
+                        .process
+                        .wait()
+                        .await
+                        .unwrap();
                 });
             }
         }
