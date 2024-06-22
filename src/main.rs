@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use axum::{routing::get, Router};
+use axum::{Router};
 use clap::Parser;
 use config::ServiceConfig;
 use outpost::PortMapping;
@@ -17,7 +17,7 @@ struct CommandLine {}
 
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
-    let args = CommandLine::parse();
+    let _args = CommandLine::parse();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -32,7 +32,7 @@ async fn main() -> Result<ExitCode> {
             #[cfg(feature = "cloudflare")]
             ServiceConfig::Cloudflare {
                 service,
-                cert_path,
+                cert_path: _,
                 ports,
             } => {
                 let ports: Vec<PortMapping> = PortMapping::from_vec(ports)?;
