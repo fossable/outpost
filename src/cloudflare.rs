@@ -40,9 +40,17 @@ impl CloudflareProxy {
     pub async fn new(service: String, fqdn: String, ports: Vec<PortMapping>) -> Result<Self> {
         let temp = TempDir::new()?;
 
+        // Write origin cert
+        std::fs::write(
+            temp.path().join("cert.pem"),
+            std::env::var("OUTPOST_CLOUDFLARE_ORIGIN_CERT")?,
+        )?;
+
         // Make sure the tunnel doesn't already exist
         if Command::new("cloudflared")
             .arg("tunnel")
+            .arg("--origincert")
+            .arg(temp.path().join("cert.pem"))
             .arg("delete")
             .arg(&service)
             .spawn()?
@@ -56,6 +64,8 @@ impl CloudflareProxy {
         // Create tunnel
         assert!(Command::new("cloudflared")
             .arg("tunnel")
+            .arg("--origincert")
+            .arg(temp.path().join("cert.pem"))
             .arg("create")
             .arg(&service)
             .spawn()?
@@ -66,6 +76,8 @@ impl CloudflareProxy {
         // Update DNS record
         assert!(Command::new("cloudflared")
             .arg("tunnel")
+            .arg("--origincert")
+            .arg(temp.path().join("cert.pem"))
             .arg("route")
             .arg("dns")
             .arg("--overwrite-dns")
@@ -90,7 +102,7 @@ impl CloudflareProxy {
         };
 
         // Find tunnel secret file rather than parsing command output
-        for entry in std::fs::read_dir("/root/.cloudflared")? {
+        for entry in std::fs::read_dir(&temp)? {
             let entry = entry?;
 
             if entry
@@ -127,18 +139,20 @@ impl CloudflareProxy {
 
         info!("Starting cloudflare tunnel");
         Ok(Self {
-            _temp: temp,
             process: Command::new("cloudflared")
                 // Try to not cede any more control to cloudflare
                 .arg("--no-autoupdate")
                 // .arg("--management-diagnostics")
                 // .arg("false")
                 .arg("tunnel")
+                .arg("--origincert")
+                .arg(temp.path().join("cert.pem"))
                 .arg("--config")
                 .arg(config_path.to_string_lossy().to_string())
                 .arg("run")
                 .arg(&service)
                 .spawn()?,
+            _temp: temp,
         })
     }
 }

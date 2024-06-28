@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use axum::{Router};
+use axum::Router;
 use clap::Parser;
 use config::ServiceConfig;
 use outpost::PortMapping;
@@ -30,11 +30,7 @@ async fn main() -> Result<ExitCode> {
     for (fqdn, service_config) in config.into_iter() {
         match service_config {
             #[cfg(feature = "cloudflare")]
-            ServiceConfig::Cloudflare {
-                service,
-                cert_path: _,
-                ports,
-            } => {
+            ServiceConfig::Cloudflare { service, ports } => {
                 let ports: Vec<PortMapping> = PortMapping::from_vec(ports)?;
                 tokio::spawn(async {
                     crate::cloudflare::CloudflareProxy::new(service, fqdn, ports)
@@ -45,6 +41,11 @@ async fn main() -> Result<ExitCode> {
                         .await
                         .unwrap();
                 });
+            }
+            #[cfg(feature = "aws")]
+            ServiceConfig::Aws { service, ports } => {
+                let ports: Vec<PortMapping> = PortMapping::from_vec(ports)?;
+                todo!();
             }
         }
     }
