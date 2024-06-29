@@ -11,7 +11,38 @@
 **outpost** allows you to expose self-hosted web services to the Internet via
 popular cloud providers.
 
-### Example with docker-compose
+### Cloudflare
+
+HTTP sites can be hosted with Cloudflare easily:
+
+```yml
+name: example_com
+
+services:
+  outpost:
+    image: fossable/outpost:latest
+    depends_on:
+      - www
+    environment:
+      OUTPOST_CONFIG: |
+        {
+          "www.example.com": {
+            "service": "www",
+            "provider": "cloudflare",
+            "ports": ["80:443"]
+          }
+        }
+      OUTPOST_CLOUDFLARE_ORIGIN_CERT: |
+        -----BEGIN PRIVATE KEY-----
+
+  www:
+    image: httpd:latest
+```
+
+### AWS
+
+`outpost` can also use an EC2 proxy to expose any TCP/UDP port. The proxy instance
+communicates with the origin service via an ephemeral wireguard tunnel.
 
 ```yml
 name: example_com
@@ -35,10 +66,12 @@ services:
         {
           "www.example.com": {
             "service": "www",
-            "provider": "cloudflare",
+            "provider": "aws",
             "ports": ["80:443"]
           }
         }
+      AWS_ACCESS_KEY_ID: <...>
+      AWS_SECRET_ACCESS_KEY: <...>
 
   www:
     image: httpd:latest

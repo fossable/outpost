@@ -26,6 +26,7 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
+    needs: github
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,6 +44,7 @@ jobs:
       - name: Find version tags
         id: get_tags
         run: |
+          set -x
           for tag in $(git tag --points-at HEAD); do
             echo "outpost=${tag##*-}" >>"$GITHUB_OUTPUT"
           done
