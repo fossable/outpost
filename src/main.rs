@@ -11,6 +11,9 @@ pub mod config;
 #[cfg(feature = "cloudflare")]
 pub mod cloudflare;
 
+#[cfg(feature = "aws")]
+pub mod aws;
+
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct CommandLine {}
