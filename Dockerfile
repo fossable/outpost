@@ -1,6 +1,8 @@
 FROM rust:slim as build
 RUN rustup target add x86_64-unknown-linux-musl
 
+RUN apt-get update && apt-get install -y musl-tools
+
 WORKDIR /build
 COPY . .
 RUN cargo build --release --all-features --target x86_64-unknown-linux-musl
