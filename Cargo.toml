@@ -6,7 +6,7 @@ license = "AGPL-3.0-only"
 name = "outpost"
 repository = "https://github.com/fossable/outpost"
 rust-version = "1.74"
-version = "0.0.7"
+version = "0.0.8"
 
 [dependencies]
 anyhow = "1.0.86"
