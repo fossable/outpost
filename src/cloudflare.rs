@@ -1,5 +1,4 @@
 use anyhow::Result;
-use outpost::PortMapping;
 use serde::Serialize;
 use tempfile::TempDir;
 use tokio::process::{Child, Command};
@@ -37,14 +36,19 @@ impl Drop for CloudflareProxy {
 
 impl CloudflareProxy {
     #[instrument(ret)]
-    pub async fn new(service: String, fqdn: String, ports: Vec<PortMapping>) -> Result<Self> {
+    pub async fn new(
+        fqdn: String,
+        origin_host: String,
+        origin_port: u16,
+        origin_cert: String,
+    ) -> Result<Self> {
         let temp = TempDir::new()?;
 
         // Write origin cert
-        std::fs::write(
-            temp.path().join("cert.pem"),
-            std::env::var("OUTPOST_CLOUDFLARE_ORIGIN_CERT")?,
-        )?;
+        std::fs::write(temp.path().join("cert.pem"), &origin_cert)?;
+
+        // Use the FQDN as the tunnel name
+        let tunnel_name = &fqdn;
 
         // Make sure the tunnel doesn't already exist
         if Command::new("cloudflared")
@@ -52,7 +56,7 @@ impl CloudflareProxy {
             .arg("--origincert")
             .arg(temp.path().join("cert.pem"))
             .arg("delete")
-            .arg(&service)
+            .arg(tunnel_name)
             .spawn()?
             .wait()
             .await?
@@ -67,7 +71,7 @@ impl CloudflareProxy {
             .arg("--origincert")
             .arg(temp.path().join("cert.pem"))
             .arg("create")
-            .arg(&service)
+            .arg(tunnel_name)
             .spawn()?
             .wait()
             .await?
@@ -81,7 +85,7 @@ impl CloudflareProxy {
             .arg("route")
             .arg("dns")
             .arg("--overwrite-dns")
-            .arg(&service)
+            .arg(tunnel_name)
             .arg(&fqdn)
             .spawn()?
             .wait()
@@ -93,6 +97,10 @@ impl CloudflareProxy {
             tunnel: "".to_string(),
             credentials_file: "".to_string(),
             ingress: vec![
+                CloudflareConfigIngress {
+                    hostname: Some(fqdn.clone()),
+                    service: format!("http://{}:{}", origin_host, origin_port),
+                },
                 // This one is always required to be last
                 CloudflareConfigIngress {
                     hostname: None,
@@ -121,16 +129,6 @@ impl CloudflareProxy {
             }
         }
 
-        for port in ports {
-            config.ingress.insert(
-                0,
-                CloudflareConfigIngress {
-                    hostname: Some(fqdn.clone()),
-                    service: format!("http://{}:{}", &service, port.local),
-                },
-            )
-        }
-
         debug!(config = ?config, "Generated cloudflared config");
 
         // Write config
@@ -150,7 +148,7 @@ impl CloudflareProxy {
                 .arg("--config")
                 .arg(config_path.to_string_lossy().to_string())
                 .arg("run")
-                .arg(&service)
+                .arg(tunnel_name)
                 .spawn()?,
             _temp: temp,
         })

@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Outpost - Tunnel Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background-color: rgb(38, 42, 43);
+            background-image:
+                linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+            background-size: 20px 20px;
+            color: #e8e6e3;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 1200px;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .header-block {
+            background: rgb(24, 26, 27);
+            border: 1px solid rgb(62, 68, 70);
+            border-radius: 8px;
+            padding: 30px;
+            text-align: center;
+        }
+
+        .logo-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 15px;
+            margin-bottom: 10px;
+        }
+
+        .logo {
+            width: 48px;
+            height: 48px;
+        }
+
+        .header-title {
+            font-size: 32px;
+            font-weight: 600;
+            color: #e8e6e3;
+        }
+
+        .header-subtitle {
+            color: #9aa0a6;
+            font-size: 14px;
+            margin-top: 8px;
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+
+        .status-up {
+            background-color: #2ecc71;
+            box-shadow: 0 0 8px #2ecc71;
+        }
+
+        .status-down {
+            background-color: #e74c3c;
+            box-shadow: 0 0 8px #e74c3c;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+        }
+
+        .stat-block {
+            background: rgb(24, 26, 27);
+            border: 1px solid rgb(62, 68, 70);
+            border-radius: 8px;
+            padding: 24px;
+        }
+
+        .stat-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 16px;
+        }
+
+        .stat-icon {
+            width: 24px;
+            height: 24px;
+        }
+
+        .stat-label {
+            font-size: 14px;
+            color: #9aa0a6;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .stat-value {
+            font-size: 32px;
+            font-weight: 600;
+            color: #2ecc71;
+            margin-bottom: 4px;
+        }
+
+        .stat-unit {
+            font-size: 14px;
+            color: #9aa0a6;
+            margin-left: 8px;
+        }
+
+        .stat-detail {
+            font-size: 12px;
+            color: #9aa0a6;
+            margin-top: 8px;
+        }
+
+        .proxy-block {
+            background: rgb(24, 26, 27);
+            border: 1px solid rgb(62, 68, 70);
+            border-radius: 8px;
+            padding: 24px;
+        }
+
+        .proxy-header {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            color: #e8e6e3;
+        }
+
+        .proxy-details {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+        }
+
+        .proxy-item {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .proxy-item-label {
+            font-size: 12px;
+            color: #9aa0a6;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .proxy-item-value {
+            font-size: 14px;
+            color: #e8e6e3;
+            font-family: 'Courier New', monospace;
+        }
+
+        .link {
+            color: #8ab4f8;
+            text-decoration: none;
+        }
+
+        .link:hover {
+            text-decoration: underline;
+        }
+
+        @media (max-width: 768px) {
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .proxy-details {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header-block">
+            <div class="logo-container">
+                <img src="/assets/outpost.svg" alt="Outpost" class="logo">
+                <h1 class="header-title">Outpost</h1>
+            </div>
+            <p class="header-subtitle">
+                <span class="status-indicator {% if tunnel_stats.tunnel_up %}status-up{% else %}status-down{% endif %}"></span>
+                Tunnel {% if tunnel_stats.tunnel_up %}Active{% else %}Inactive{% endif %}
+                {% if tunnel_stats.tunnel_up %} &middot; Uptime: {{ tunnel_stats.uptime_seconds }}s{% endif %}
+            </p>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-block">
+                <div class="stat-header">
+                    <img src="/assets/wireguard.svg" alt="Sent" class="stat-icon">
+                    <span class="stat-label">Data Sent</span>
+                </div>
+                <div>
+                    <span class="stat-value">{{ tunnel_stats.bytes_sent_formatted }}</span>
+                </div>
+                <div class="stat-detail">{{ tunnel_stats.packets_sent }} packets</div>
+            </div>
+
+            <div class="stat-block">
+                <div class="stat-header">
+                    <img src="/assets/wireguard.svg" alt="Received" class="stat-icon">
+                    <span class="stat-label">Data Received</span>
+                </div>
+                <div>
+                    <span class="stat-value">{{ tunnel_stats.bytes_received_formatted }}</span>
+                </div>
+                <div class="stat-detail">{{ tunnel_stats.packets_received }} packets</div>
+            </div>
+        </div>
+
+        {% if let Some(info) = proxy_info %}
+            {% match info %}
+                {% when ProxyInfo::Aws with { instance_id, instance_type, region, public_ip, private_ip, state, launch_time } %}
+                    <div class="proxy-block">
+                        <div class="proxy-header">AWS Proxy Instance</div>
+                        <div class="proxy-details">
+                            <div class="proxy-item">
+                                <div class="proxy-item-label">Instance ID</div>
+                                <div class="proxy-item-value">{{ instance_id }}</div>
+                            </div>
+                            <div class="proxy-item">
+                                <div class="proxy-item-label">Instance Type</div>
+                                <div class="proxy-item-value">{{ instance_type }}</div>
+                            </div>
+                            <div class="proxy-item">
+                                <div class="proxy-item-label">Region</div>
+                                <div class="proxy-item-value">{{ region }}</div>
+                            </div>
+                            <div class="proxy-item">
+                                <div class="proxy-item-label">Public IP</div>
+                                <div class="proxy-item-value">{{ public_ip }}</div>
+                            </div>
+                            <div class="proxy-item">
+                                <div class="proxy-item-label">Private IP</div>
+                                <div class="proxy-item-value">{{ private_ip }}</div>
+                            </div>
+                            <div class="proxy-item">
+                                <div class="proxy-item-label">State</div>
+                                <div class="proxy-item-value">{{ state }}</div>
+                            </div>
+                            <div class="proxy-item">
+                                <div class="proxy-item-label">Launch Time</div>
+                                <div class="proxy-item-value">{{ launch_time }}</div>
+                            </div>
+                        </div>
+                    </div>
+                {% when ProxyInfo::Cloudflare with { hostname, connector_id, connections } %}
+                    <div class="proxy-block">
+                        <div class="proxy-header">Cloudflare Tunnel</div>
+                        <div class="proxy-details">
+                            <div class="proxy-item">
+                                <div class="proxy-item-label">Hostname</div>
+                                <div class="proxy-item-value">{{ hostname }}</div>
+                            </div>
+                            <div class="proxy-item">
+                                <div class="proxy-item-label">Connector ID</div>
+                                <div class="proxy-item-value">{{ connector_id }}</div>
+                            </div>
+                            <div class="proxy-item">
+                                <div class="proxy-item-label">Active Connections</div>
+                                <div class="proxy-item-value">{{ connections }}</div>
+                            </div>
+                        </div>
+                    </div>
+            {% endmatch %}
+        {% endif %}
+    </div>
+</body>
+</html>

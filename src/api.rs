@@ -1,0 +1,159 @@
+use askama::Template;
+use axum::{
+    extract::State,
+    http::{header, StatusCode},
+    response::{Html, IntoResponse, Response},
+    routing::get,
+    Router,
+};
+use rust_embed::RustEmbed;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+#[derive(RustEmbed)]
+#[folder = "assets/"]
+struct Assets;
+
+#[derive(Clone, Default)]
+pub struct AppState {
+    pub stats: Arc<RwLock<TunnelStats>>,
+    pub proxy_info: Arc<RwLock<Option<ProxyInfo>>>,
+}
+
+#[derive(Clone, Default)]
+pub struct TunnelStats {
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub bytes_sent_formatted: String,
+    pub bytes_received_formatted: String,
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub tunnel_up: bool,
+    pub uptime_seconds: u64,
+}
+
+impl TunnelStats {
+    pub fn format_sizes(&mut self) {
+        self.bytes_sent_formatted = format_bytes(self.bytes_sent);
+        self.bytes_received_formatted = format_bytes(self.bytes_received);
+    }
+
+    /// Create example stats for demo mode
+    pub fn example() -> Self {
+        let mut stats = Self {
+            bytes_sent: 1_234_567_890,
+            bytes_received: 9_876_543_210,
+            bytes_sent_formatted: String::new(),
+            bytes_received_formatted: String::new(),
+            packets_sent: 45_678,
+            packets_received: 123_456,
+            tunnel_up: true,
+            uptime_seconds: 3665, // 1h 1m 5s
+        };
+        stats.format_sizes();
+        stats
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit_idx = 0;
+
+    while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_idx += 1;
+    }
+
+    if unit_idx == 0 {
+        format!("{} {}", size as u64, UNITS[unit_idx])
+    } else {
+        format!("{:.2} {}", size, UNITS[unit_idx])
+    }
+}
+
+#[derive(Clone)]
+pub enum ProxyInfo {
+    Aws {
+        instance_id: String,
+        instance_type: String,
+        region: String,
+        public_ip: String,
+        private_ip: String,
+        state: String,
+        launch_time: String,
+    },
+    Cloudflare {
+        hostname: String,
+        connector_id: String,
+        connections: u32,
+    },
+}
+
+impl ProxyInfo {
+    /// Create example AWS proxy info for demo mode
+    pub fn example_aws() -> Self {
+        ProxyInfo::Aws {
+            instance_id: "i-0123456789abcdef0".to_string(),
+            instance_type: "t4g.nano".to_string(),
+            region: "us-east-2".to_string(),
+            public_ip: "203.0.113.42".to_string(),
+            private_ip: "172.17.0.1".to_string(),
+            state: "running".to_string(),
+            launch_time: "2025-11-11 19:30:00 UTC".to_string(),
+        }
+    }
+
+    /// Create example Cloudflare proxy info for demo mode
+    pub fn example_cloudflare() -> Self {
+        ProxyInfo::Cloudflare {
+            hostname: "www.example.com".to_string(),
+            connector_id: "abc123-def456-ghi789".to_string(),
+            connections: 4,
+        }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "index.html")]
+pub struct IndexTemplate {
+    pub tunnel_stats: TunnelStats,
+    pub proxy_info: Option<ProxyInfo>,
+}
+
+pub async fn assets(axum::extract::Path(file): axum::extract::Path<String>) -> Response {
+    let path = file.trim_start_matches('/');
+
+    match Assets::get(path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, mime.as_ref())],
+                content.data,
+            )
+                .into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "404 Not Found").into_response(),
+    }
+}
+
+pub fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(index))
+        .route("/assets/*file", get(assets))
+        .with_state(state)
+}
+
+pub async fn index(State(state): State<AppState>) -> impl IntoResponse {
+    let mut stats = state.stats.read().await.clone();
+    stats.format_sizes();
+    let proxy_info = state.proxy_info.read().await.clone();
+
+    let template = IndexTemplate {
+        tunnel_stats: stats,
+        proxy_info,
+    };
+
+    Html(template.render().unwrap())
+}
