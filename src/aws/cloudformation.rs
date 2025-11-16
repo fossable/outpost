@@ -15,6 +15,7 @@ pub struct CloudFormationTemplate {
     pub proxy_wg_public_key: String,
     pub origin_wg_public_key: String,
     pub preshared_key: String,
+    pub debug: bool,
 }
 
 impl CloudFormationTemplate {
@@ -28,10 +29,9 @@ impl CloudFormationTemplate {
                     "Type": "String",
                     "Description": "Route53 Hosted Zone ID for DNS record"
                 },
-                "LatestUbuntuAMI": {
-                    "Type": "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>",
-                    "Default": self.get_ami_ssm_parameter(),
-                    "Description": "Latest Ubuntu 22.04 LTS AMI from SSM Parameter Store"
+                "NixOSAMI": {
+                    "Type": "AWS::EC2::Image::Id",
+                    "Description": "NixOS AMI ID"
                 }
             },
 
@@ -119,22 +119,7 @@ impl CloudFormationTemplate {
                     "Properties": {
                         "GroupDescription": "Allow WireGuard and ingress traffic only",
                         "VpcId": {"Ref": "VPC"},
-                        "SecurityGroupIngress": [
-                            {
-                                "IpProtocol": "udp",
-                                "FromPort": 51820,
-                                "ToPort": 51820,
-                                "CidrIp": format!("{}/32", self.origin_ip),
-                                "Description": "WireGuard from origin"
-                            },
-                            {
-                                "IpProtocol": self.ingress_protocol.as_str(),
-                                "FromPort": self.ingress_port,
-                                "ToPort": self.ingress_port,
-                                "CidrIp": "0.0.0.0/0",
-                                "Description": "Ingress traffic"
-                            }
-                        ],
+                        "SecurityGroupIngress": self.generate_security_group_rules(),
                         "SecurityGroupEgress": [{
                             "IpProtocol": "-1",
                             "CidrIp": "0.0.0.0/0",
@@ -167,7 +152,8 @@ impl CloudFormationTemplate {
                                     "Effect": "Allow",
                                     "Action": [
                                         "cloudformation:DeleteStack",
-                                        "cloudformation:DescribeStacks"
+                                        "cloudformation:DescribeStacks",
+                                        "cloudformation:DescribeStackResource"
                                     ],
                                     "Resource": {
                                         "Fn::Sub": "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*"
@@ -191,14 +177,12 @@ impl CloudFormationTemplate {
                     "DependsOn": "AttachGateway",
                     "Properties": {
                         "InstanceType": self.instance_type.clone(),
-                        "ImageId": {"Ref": "LatestUbuntuAMI"},
+                        "ImageId": {"Ref": "NixOSAMI"},
                         "SubnetId": {"Ref": "PublicSubnet"},
                         "SecurityGroupIds": [{"Ref": "SecurityGroup"}],
                         "IamInstanceProfile": {"Ref": "InstanceProfile"},
                         "UserData": {
-                            "Fn::Base64": {
-                                "Fn::Sub": self.generate_userdata()
-                            }
+                            "Fn::Base64": self.generate_userdata()
                         },
                         "Tags": [{
                             "Key": "Name",
@@ -252,9 +236,30 @@ impl CloudFormationTemplate {
         Ok(serde_json::to_string_pretty(&template)?)
     }
 
-    fn get_ami_ssm_parameter(&self) -> String {
+    fn generate_security_group_rules(&self) -> serde_json::Value {
+        let rules = vec![
+            json!({
+                "IpProtocol": "udp",
+                "FromPort": 51820,
+                "ToPort": 51820,
+                "CidrIp": format!("{}/32", self.origin_ip),
+                "Description": "WireGuard from origin"
+            }),
+            json!({
+                "IpProtocol": self.ingress_protocol.as_str(),
+                "FromPort": self.ingress_port,
+                "ToPort": self.ingress_port,
+                "CidrIp": "0.0.0.0/0",
+                "Description": "Ingress traffic"
+            }),
+        ];
+
+        serde_json::Value::Array(rules)
+    }
+
+    pub fn get_architecture(&self) -> &str {
         // Determine architecture based on instance type
-        let architecture = if self.instance_type.starts_with("t4g.")
+        if self.instance_type.starts_with("t4g.")
             || self.instance_type.starts_with("a1.")
             || self.instance_type.starts_with("m6g.")
             || self.instance_type.starts_with("m7g.")
@@ -266,129 +271,31 @@ impl CloudFormationTemplate {
         {
             "arm64"
         } else {
-            "amd64"
-        };
-
-        // Return SSM parameter path for latest Ubuntu 22.04 LTS AMI
-        format!(
-            "/aws/service/canonical/ubuntu/server/22.04/stable/current/{}/hvm/ebs-gp2/ami-id",
-            architecture
-        )
+            "x86_64"
+        }
     }
 
-    fn generate_userdata(&self) -> String {
-        let protocol = self.ingress_protocol.as_str();
+    fn generate_userdata(&self) -> serde_json::Value {
+        // Load the Nix configuration template at compile time
+        const NIX_TEMPLATE: &str = include_str!("../../templates/proxy.nix");
 
-        format!(
-            r#"#!/bin/bash
-set -e
+        // Replace placeholders in the Nix template
+        let nix_config = NIX_TEMPLATE
+            .replace(
+                "debug = false",
+                &format!("debug = {}", if self.debug { "true" } else { "false" }),
+            )
+            .replace("{PROXY_WG_PRIVATE_KEY}", &self.proxy_wg_private_key)
+            .replace("{PROTOCOL}", &self.ingress_protocol)
+            .replace("{INGRESS_PORT}", &self.ingress_port.to_string())
+            .replace("{ORIGIN_PORT}", &self.origin_port.to_string())
+            .replace("{ORIGIN_WG_PUBLIC_KEY}", &self.origin_wg_public_key)
+            .replace("{PRESHARED_KEY}", &self.preshared_key)
+            .replace("{ORIGIN_IP}", &self.origin_ip)
+            .replace("{STACK_NAME}", &self.stack_name)
+            .replace("{REGION}", &self.region);
 
-# Update system
-apt-get update -y
-apt-get upgrade -y
-
-# Install WireGuard and required tools
-apt-get install -y wireguard iptables socat curl jq awscli
-
-# Enable IP forwarding
-echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-sysctl -p
-
-# Configure WireGuard
-cat > /etc/wireguard/wg0.conf <<'EOF'
-[Interface]
-Address = 172.17.0.1/24
-ListenPort = 51820
-PrivateKey = {}
-
-# IP forwarding rules
-PostUp = iptables -t nat -A PREROUTING -p {} --dport {} -j DNAT --to-destination 172.17.0.2:{}
-PostUp = iptables -t nat -A POSTROUTING -s 172.17.0.0/24 -j MASQUERADE
-PostDown = iptables -t nat -D PREROUTING -p {} --dport {} -j DNAT --to-destination 172.17.0.2:{}
-PostDown = iptables -t nat -D POSTROUTING -s 172.17.0.0/24 -j MASQUERADE
-
-[Peer]
-PublicKey = {}
-PresharedKey = {}
-AllowedIPs = 172.17.0.2/32
-PersistentKeepalive = 25
-EOF
-
-# Start WireGuard
-systemctl enable wg-quick@wg0
-systemctl start wg-quick@wg0
-
-# Create self-destruct monitoring service
-cat > /usr/local/bin/outpost-monitor.sh <<'MONITOR_EOF'
-#!/bin/bash
-
-ORIGIN_IP="{}"
-STACK_NAME="{}"
-REGION="{}"
-FAIL_COUNT=0
-MAX_FAILS=60  # 5 minutes with 5-second checks
-
-while true; do
-    # Try to ping the origin through the WireGuard tunnel
-    if ping -c 1 -W 2 172.17.0.2 > /dev/null 2>&1; then
-        FAIL_COUNT=0
-    else
-        FAIL_COUNT=$((FAIL_COUNT + 1))
-        echo "$(date): Origin unreachable. Fail count: $FAIL_COUNT/$MAX_FAILS"
-
-        if [ $FAIL_COUNT -ge $MAX_FAILS ]; then
-            echo "$(date): Origin unreachable for 5 minutes. Self-destructing..."
-            aws cloudformation delete-stack --stack-name "$STACK_NAME" --region "$REGION"
-            exit 0
-        fi
-    fi
-
-    sleep 5
-done
-MONITOR_EOF
-
-chmod +x /usr/local/bin/outpost-monitor.sh
-
-# Create systemd service for monitoring
-cat > /etc/systemd/system/outpost-monitor.service <<'SERVICE_EOF'
-[Unit]
-Description=Outpost Origin Monitor
-After=network.target wg-quick@wg0.service
-Requires=wg-quick@wg0.service
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/outpost-monitor.sh
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-SERVICE_EOF
-
-# Start monitoring service
-systemctl daemon-reload
-systemctl enable outpost-monitor
-systemctl start outpost-monitor
-
-echo "Outpost proxy setup complete"
-
-# Signal CloudFormation that initialization is complete
-curl -X PUT -H 'Content-Type: application/json' --data '{{"Status":"SUCCESS","Reason":"Instance initialized","UniqueId":"ProxyInstance","Data":"Ready"}}' "${{WaitHandle}}"
-"#,
-            self.proxy_wg_private_key,
-            protocol,
-            self.ingress_port,
-            self.origin_port,
-            protocol,
-            self.ingress_port,
-            self.origin_port,
-            self.origin_wg_public_key,
-            self.preshared_key,
-            self.origin_ip,
-            self.stack_name,
-            self.region
-        )
+        json!(nix_config)
     }
 }
 
@@ -397,7 +304,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ami_ssm_parameter_x86() {
+    fn test_architecture_detection_x86() {
         let template = CloudFormationTemplate {
             stack_name: "test".to_string(),
             region: "us-east-2".to_string(),
@@ -412,14 +319,14 @@ mod tests {
             proxy_wg_public_key: "test_pub".to_string(),
             origin_wg_public_key: "origin_pub".to_string(),
             preshared_key: "preshared".to_string(),
+            debug: false,
         };
 
-        let param = template.get_ami_ssm_parameter();
-        assert!(param.contains("amd64"));
+        assert_eq!(template.get_architecture(), "x86_64");
     }
 
     #[test]
-    fn test_ami_ssm_parameter_arm() {
+    fn test_architecture_detection_arm() {
         let template = CloudFormationTemplate {
             stack_name: "test".to_string(),
             region: "us-east-2".to_string(),
@@ -434,10 +341,10 @@ mod tests {
             proxy_wg_public_key: "test_pub".to_string(),
             origin_wg_public_key: "origin_pub".to_string(),
             preshared_key: "preshared".to_string(),
+            debug: false,
         };
 
-        let param = template.get_ami_ssm_parameter();
-        assert!(param.contains("arm64"));
+        assert_eq!(template.get_architecture(), "arm64");
     }
 
     #[test]
@@ -456,10 +363,15 @@ mod tests {
             proxy_wg_public_key: "test_pub".to_string(),
             origin_wg_public_key: "origin_pub".to_string(),
             preshared_key: "preshared".to_string(),
+            debug: false,
         };
 
         let userdata = template.generate_userdata();
-        assert!(userdata.contains("-p tcp --dport 80"));
+        let userdata_str = serde_json::to_string(&userdata).unwrap();
+        // Check for NixOS configuration syntax and TCP protocol
+        assert!(userdata_str.contains("{ config, pkgs, lib, ... }:"));
+        assert!(userdata_str.contains("debug = false"));
+        assert!(userdata_str.contains("-p tcp --dport 80"));
     }
 
     #[test]
@@ -478,9 +390,41 @@ mod tests {
             proxy_wg_public_key: "test_pub".to_string(),
             origin_wg_public_key: "origin_pub".to_string(),
             preshared_key: "preshared".to_string(),
+            debug: false,
         };
 
         let userdata = template.generate_userdata();
-        assert!(userdata.contains("-p udp --dport 53"));
+        let userdata_str = serde_json::to_string(&userdata).unwrap();
+        // Check for NixOS configuration syntax and UDP protocol
+        assert!(userdata_str.contains("{ config, pkgs, lib, ... }:"));
+        assert!(userdata_str.contains("debug = false"));
+        assert!(userdata_str.contains("-p udp --dport 53"));
+    }
+
+    #[test]
+    fn test_debug_mode_enabled() {
+        let template = CloudFormationTemplate {
+            stack_name: "test".to_string(),
+            region: "us-east-2".to_string(),
+            ingress_host: "test.example.com".to_string(),
+            ingress_port: 80,
+            ingress_protocol: "tcp".to_string(),
+            origin_host: "localhost".to_string(),
+            origin_port: 8080,
+            origin_ip: "1.2.3.4".to_string(),
+            instance_type: "t4g.nano".to_string(),
+            proxy_wg_private_key: "test_key".to_string(),
+            proxy_wg_public_key: "test_pub".to_string(),
+            origin_wg_public_key: "origin_pub".to_string(),
+            preshared_key: "preshared".to_string(),
+            debug: true,
+        };
+
+        let userdata = template.generate_userdata();
+        let userdata_str = serde_json::to_string(&userdata).unwrap();
+        // Check that debug mode is enabled
+        assert!(userdata_str.contains("debug = true"));
+        assert!(userdata_str.contains("services.openssh"));
+        assert!(userdata_str.contains("lib.mkIf debug"));
     }
 }

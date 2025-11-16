@@ -86,6 +86,10 @@ pub enum ServiceConfig {
         /// AWS secret access key
         #[clap(long, env = "AWS_SECRET_ACCESS_KEY")]
         secret_access_key: String,
+
+        /// Enable debug mode (allows SSH access to proxy instance with hardcoded password)
+        #[clap(long, env = "OUTPOST_AWS_DEBUG")]
+        debug: bool,
     },
 }
 

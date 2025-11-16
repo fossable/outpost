@@ -12,6 +12,7 @@ version = "0.0.8"
 anyhow = "1.0.86"
 askama = { version = "0.12.1", features = ["with-axum"] }
 askama_axum = "0.4.0"
+atty = "0.2"
 aws-config = { version = "1.5.3", optional = true, features = [
   "behavior-version-latest",
 ] }
@@ -24,6 +25,7 @@ base64 = "0.22"
 clap = { version = "4.5.4", features = ["string", "derive", "env"] }
 rust-embed = { version = "8.4.0", features = ["axum", "debug-embed"] }
 futures = "0.3.30"
+indicatif = "0.17"
 mime_guess = "2.0"
 rand = "0.8"
 reqwest = "0.12"

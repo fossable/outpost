@@ -17,9 +17,6 @@ RUN apk add --no-cache curl
 # Install cloudflared
 RUN curl -L -o /usr/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/download/2024.6.1/cloudflared-linux-amd64" && chmod +x /usr/bin/cloudflared
 
-# Install AWS SDK
-# TODO
-
 # Install outpost
 COPY --from=build /build/target/x86_64-unknown-linux-musl/release/outpost /usr/bin/outpost
 

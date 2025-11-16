@@ -55,55 +55,127 @@ async fn main() -> Result<ExitCode> {
             });
         }
         #[cfg(feature = "aws")]
-        ServiceConfig::Aws { hosted_zone_id, instance_type, .. } => {
+        ServiceConfig::Aws { hosted_zone_id, instance_type, debug, .. } => {
             let ingress = service_config.ingress()?;
             let origin = service_config.origin()?;
             let regions = service_config.aws_regions().unwrap_or_default();
             let hosted_zone_id = hosted_zone_id.clone();
             let instance_type = instance_type.clone();
+            let debug = *debug;
             let region = regions.first().cloned().unwrap_or_default();
+
+            // Set up graceful shutdown handler early using a broadcast channel
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+            // Spawn a task to listen for shutdown signals
+            tokio::spawn(async move {
+                let ctrl_c = async {
+                    signal::ctrl_c()
+                        .await
+                        .expect("failed to install Ctrl+C handler");
+                };
+
+                #[cfg(unix)]
+                let terminate = async {
+                    signal::unix::signal(signal::unix::SignalKind::terminate())
+                        .expect("failed to install SIGTERM handler")
+                        .recv()
+                        .await;
+                };
+
+                #[cfg(not(unix))]
+                let terminate = std::future::pending::<()>();
+
+                tokio::select! {
+                    _ = ctrl_c => {
+                        info!("Received Ctrl+C signal");
+                    }
+                    _ = terminate => {
+                        info!("Received SIGTERM signal");
+                    }
+                }
+
+                // Broadcast shutdown to all subscribers
+                let _ = shutdown_tx.send(());
+            });
 
             // Generate WireGuard keys for both sides
             let wg_keys = crate::wireguard::WireGuardPair::generate().await?;
 
             // Get the public IP of this machine (origin)
             info!("Detecting origin IP address...");
-            let origin_ip = reqwest::get("https://api.ipify.org").await?.text().await?;
+            let origin_ip = tokio::select! {
+                result = async {
+                    reqwest::get("https://api.ipify.org").await?.text().await
+                } => result?,
+                _ = shutdown_rx.recv() => {
+                    info!("Shutdown signal received during IP detection");
+                    return Ok(ExitCode::SUCCESS);
+                }
+            };
 
             info!("Origin IP: {}", origin_ip);
 
             // Deploy the AWS proxy
-            let proxy = crate::aws::AwsProxy::deploy(
-                ingress.host.clone(),
-                ingress.port,
-                ingress.protocol.clone(),
-                origin.host,
-                origin.port,
-                origin_ip,
-                regions,
-                instance_type.clone(),
-                wg_keys.proxy.private_key,
-                wg_keys.proxy.public_key.clone(),
-                wg_keys.origin.public_key.clone(),
-                wg_keys.origin.preshared_key.clone(),
-                hosted_zone_id,
-            )
-            .await?;
+            let mut shutdown_rx2 = shutdown_rx.resubscribe();
+            let proxy = tokio::select! {
+                result = crate::aws::AwsProxy::deploy(
+                    ingress.host.clone(),
+                    ingress.port,
+                    ingress.protocol.clone(),
+                    origin.host,
+                    origin.port,
+                    origin_ip,
+                    regions,
+                    instance_type.clone(),
+                    wg_keys.proxy.private_key,
+                    wg_keys.proxy.public_key.clone(),
+                    wg_keys.origin.public_key.clone(),
+                    wg_keys.origin.preshared_key.clone(),
+                    hosted_zone_id,
+                    debug,
+                ) => result?,
+                _ = shutdown_rx2.recv() => {
+                    info!("Shutdown signal received during deployment");
+                    return Ok(ExitCode::SUCCESS);
+                }
+            };
 
             // Wait for stack to be completely deployed and get the proxy IP
             info!("Waiting for CloudFormation stack to complete deployment...");
-            let proxy_ip = proxy.wait_for_completion().await?;
+            let mut shutdown_rx3 = shutdown_rx.resubscribe();
+            let proxy_ip = tokio::select! {
+                result = proxy.wait_for_completion() => result?,
+                _ = shutdown_rx3.recv() => {
+                    info!("Shutdown signal received during stack creation");
+                    info!("Cleaning up AWS resources...");
+                    if let Err(e) = proxy.cleanup().await {
+                        tracing::warn!("Failed to cleanup AWS proxy: {}", e);
+                    }
+                    return Ok(ExitCode::SUCCESS);
+                }
+            };
             let proxy_endpoint = format!("{}:51820", proxy_ip);
 
             info!("Setting up WireGuard tunnel to proxy at {}", proxy_endpoint);
 
             // Set up WireGuard tunnel on the origin side using boringtun
-            let tunnel = crate::wireguard::OriginTunnel::setup(
-                wg_keys.origin,
-                wg_keys.proxy.public_key,
-                proxy_endpoint,
-            )
-            .await?;
+            let mut shutdown_rx4 = shutdown_rx.resubscribe();
+            let tunnel = tokio::select! {
+                result = crate::wireguard::OriginTunnel::setup(
+                    wg_keys.origin,
+                    wg_keys.proxy.public_key,
+                    proxy_endpoint,
+                ) => result?,
+                _ = shutdown_rx4.recv() => {
+                    info!("Shutdown signal received during tunnel setup");
+                    info!("Cleaning up AWS resources...");
+                    if let Err(e) = proxy.cleanup().await {
+                        tracing::warn!("Failed to cleanup AWS proxy: {}", e);
+                    }
+                    return Ok(ExitCode::SUCCESS);
+                }
+            };
 
             info!("AWS proxy deployment complete");
 
@@ -130,43 +202,17 @@ async fn main() -> Result<ExitCode> {
                 stats.tunnel_up = true;
             }
 
-            // Set up graceful shutdown handler
-            let shutdown_signal = async {
-                let ctrl_c = async {
-                    signal::ctrl_c()
-                        .await
-                        .expect("failed to install Ctrl+C handler");
-                };
-
-                #[cfg(unix)]
-                let terminate = async {
-                    signal::unix::signal(signal::unix::SignalKind::terminate())
-                        .expect("failed to install SIGTERM handler")
-                        .recv()
-                        .await;
-                };
-
-                #[cfg(not(unix))]
-                let terminate = std::future::pending::<()>();
-
-                tokio::select! {
-                    _ = ctrl_c => {
-                        info!("Received Ctrl+C signal");
-                    }
-                    _ = terminate => {
-                        info!("Received SIGTERM signal");
-                    }
-                }
-            };
-
             let app = crate::api::router(state);
 
             let listener = TcpListener::bind("0.0.0.0:3000").await?;
 
             // Run server with graceful shutdown
             info!("Dashboard available at http://0.0.0.0:3000");
+            let mut shutdown_rx5 = shutdown_rx.resubscribe();
             axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx5.recv().await;
+                })
                 .await?;
 
             // Clean up AWS resources on graceful shutdown

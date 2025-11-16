@@ -3,8 +3,10 @@ pub mod cloudformation;
 use anyhow::{bail, Context, Result};
 use aws_config::{meta::region::RegionProviderChain, Region};
 use aws_sdk_cloudformation::Client as CfnClient;
+use aws_sdk_ec2::Client as Ec2Client;
 use aws_sdk_route53::Client as Route53Client;
 use cloudformation::CloudFormationTemplate;
+use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{debug, info};
 
 pub struct AwsProxy {
@@ -73,6 +75,66 @@ async fn validate_route53_configuration(
     Ok(())
 }
 
+/// Query the latest NixOS AMI for the given architecture
+async fn get_latest_nixos_ami(ec2_client: &Ec2Client, architecture: &str) -> Result<String> {
+    debug!(
+        "Looking up latest NixOS AMI for architecture: {}",
+        architecture
+    );
+
+    // NixOS official AWS account ID
+    const NIXOS_OWNER_ID: &str = "427812963091";
+
+    let images = ec2_client
+        .describe_images()
+        .owners(NIXOS_OWNER_ID)
+        .filters(
+            aws_sdk_ec2::types::Filter::builder()
+                .name("name")
+                .values("nixos/25.05*")
+                .build(),
+        )
+        .filters(
+            aws_sdk_ec2::types::Filter::builder()
+                .name("architecture")
+                .values(architecture)
+                .build(),
+        )
+        .send()
+        .await
+        .context("Failed to query NixOS AMIs from EC2")?;
+
+    let mut images_list = images.images().to_vec();
+
+    if images_list.is_empty() {
+        bail!(
+            "No NixOS AMIs found for architecture {}. Please check the region supports NixOS AMIs.",
+            architecture
+        );
+    }
+
+    // Sort by creation date (newest first)
+    images_list.sort_by(|a, b| {
+        let date_a = a.creation_date().unwrap_or("");
+        let date_b = b.creation_date().unwrap_or("");
+        date_b.cmp(date_a)
+    });
+
+    let latest_ami = images_list.first().context("No AMIs found after sorting")?;
+
+    let ami_id = latest_ami
+        .image_id()
+        .context("AMI does not have an image ID")?;
+
+    info!(
+        "Found latest NixOS AMI: {} (created: {})",
+        ami_id,
+        latest_ami.creation_date().unwrap_or("unknown")
+    );
+
+    Ok(ami_id.to_string())
+}
+
 impl AwsProxy {
     pub async fn deploy(
         ingress_host: String,
@@ -88,6 +150,7 @@ impl AwsProxy {
         origin_wg_public_key: String,
         preshared_key: String,
         hosted_zone_id: String,
+        debug: bool,
     ) -> Result<Self> {
         // Use the first region in the list, or fall back to defaults
         let region = regions
@@ -103,6 +166,7 @@ impl AwsProxy {
 
         let config = aws_config::from_env().region(region_provider).load().await;
         let cfn_client = CfnClient::new(&config);
+        let ec2_client = Ec2Client::new(&config);
         let route53_client = Route53Client::new(&config);
 
         // Validate Route53 configuration before proceeding
@@ -126,10 +190,14 @@ impl AwsProxy {
             proxy_wg_public_key,
             origin_wg_public_key,
             preshared_key,
+            debug,
         };
 
         let template_body = template.generate()?;
         debug!("Generated CloudFormation template:\n{}", template_body);
+
+        // Query for the latest NixOS AMI
+        let ami_id = get_latest_nixos_ami(&ec2_client, template.get_architecture()).await?;
 
         // Deploy the CloudFormation stack
         info!("Creating CloudFormation stack: {}", stack_name);
@@ -143,7 +211,14 @@ impl AwsProxy {
                     .parameter_value(hosted_zone_id)
                     .build(),
             )
+            .parameters(
+                aws_sdk_cloudformation::types::Parameter::builder()
+                    .parameter_key("NixOSAMI")
+                    .parameter_value(ami_id)
+                    .build(),
+            )
             .capabilities(aws_sdk_cloudformation::types::Capability::CapabilityIam)
+            .on_failure(aws_sdk_cloudformation::types::OnFailure::Delete)
             .send()
             .await
             .context("Failed to create CloudFormation stack")?;
@@ -164,6 +239,26 @@ impl AwsProxy {
             self.stack_name
         );
 
+        // Check if we're connected to a TTY
+        let is_tty = atty::is(atty::Stream::Stdout);
+
+        let progress = if is_tty {
+            let pb = ProgressBar::new(1);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{bar:40.cyan/blue} {pos}/{len} {msg}")
+                    .unwrap()
+                    .progress_chars("━━╸"),
+            );
+            pb.enable_steady_tick(std::time::Duration::from_millis(100));
+            Some(pb)
+        } else {
+            None
+        };
+
+        let mut completed_resources = std::collections::HashSet::new();
+        let mut total_resources = 0u64;
+
         loop {
             let response = self
                 .cfn_client
@@ -181,12 +276,85 @@ impl AwsProxy {
             let status = stack
                 .stack_status()
                 .context("Stack does not have a status")?;
-            info!("Stack status: {:?}", status);
+
+            // Get stack events to track progress
+            if let Some(ref pb) = progress {
+                if let Ok(events) = self
+                    .cfn_client
+                    .describe_stack_events()
+                    .stack_name(&self.stack_name)
+                    .send()
+                    .await
+                {
+                    // Count total unique resources and completed ones
+                    for event in events.stack_events() {
+                        if let Some(resource_id) = event.logical_resource_id() {
+                            // Skip the stack itself
+                            if resource_id == self.stack_name {
+                                continue;
+                            }
+
+                            // Track total unique resources
+                            total_resources = total_resources.max(
+                                events
+                                    .stack_events()
+                                    .iter()
+                                    .filter(|e| {
+                                        e.logical_resource_id()
+                                            .map_or(false, |id| id != self.stack_name)
+                                    })
+                                    .filter_map(|e| e.logical_resource_id())
+                                    .collect::<std::collections::HashSet<_>>()
+                                    .len() as u64,
+                            );
+
+                            // Track completed resources
+                            if let Some(status) = event.resource_status() {
+                                let status_str = status.as_str();
+                                if status_str.ends_with("_COMPLETE")
+                                    && !status_str.starts_with("DELETE")
+                                {
+                                    completed_resources.insert(resource_id.to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    // Update progress bar
+                    if total_resources > 0 {
+                        pb.set_length(total_resources);
+                        pb.set_position(completed_resources.len() as u64);
+                    }
+
+                    // Show the latest event
+                    if let Some(latest_event) = events.stack_events().first() {
+                        let resource = latest_event.logical_resource_id().unwrap_or("Stack");
+                        let event_status = latest_event
+                            .resource_status()
+                            .map(|s| s.as_str())
+                            .unwrap_or("UNKNOWN");
+                        let reason = latest_event.resource_status_reason().unwrap_or("");
+
+                        let msg = if reason.is_empty() {
+                            format!("{}: {}", resource, event_status)
+                        } else {
+                            format!("{}: {} - {}", resource, event_status, reason)
+                        };
+                        pb.set_message(msg);
+                    }
+                }
+            } else {
+                info!("Stack status: {:?}", status);
+            }
 
             use aws_sdk_cloudformation::types::StackStatus;
             match status {
                 StackStatus::CreateComplete => {
-                    info!("Stack creation completed successfully");
+                    if let Some(pb) = progress {
+                        pb.finish_with_message("Stack creation completed successfully");
+                    } else {
+                        info!("Stack creation completed successfully");
+                    }
 
                     // Extract the proxy public IP from outputs
                     let proxy_ip = stack
@@ -199,17 +367,32 @@ impl AwsProxy {
                     info!("Proxy public IP: {}", proxy_ip);
                     return Ok(proxy_ip.to_string());
                 }
-                StackStatus::CreateInProgress => {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
+                StackStatus::CreateInProgress | StackStatus::DeleteInProgress => {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 }
                 StackStatus::CreateFailed
                 | StackStatus::RollbackComplete
                 | StackStatus::RollbackFailed
-                | StackStatus::RollbackInProgress => {
+                | StackStatus::RollbackInProgress
+                | StackStatus::DeleteFailed
+                | StackStatus::DeleteComplete => {
                     let reason = stack.stack_status_reason().unwrap_or("Unknown reason");
+                    if let Some(pb) = progress {
+                        pb.finish_with_message(format!(
+                            "Stack creation failed: {} - {}",
+                            status.as_str(),
+                            reason
+                        ));
+                    }
                     bail!("Stack creation failed: {} - {}", status.as_str(), reason);
                 }
                 _ => {
+                    if let Some(pb) = progress {
+                        pb.finish_with_message(format!(
+                            "Unexpected stack status: {}",
+                            status.as_str()
+                        ));
+                    }
                     bail!("Unexpected stack status: {}", status.as_str());
                 }
             }
@@ -231,15 +414,180 @@ impl AwsProxy {
             "CloudFormation stack deletion initiated: {}",
             self.stack_name
         );
-        Ok(())
-    }
-}
 
-impl Drop for AwsProxy {
-    fn drop(&mut self) {
-        info!(
-            "AwsProxy dropped - if not cleaned up, stack {} will self-destruct when origin is unreachable",
-            self.stack_name
-        );
+        // Check if we're connected to a TTY
+        let is_tty = atty::is(atty::Stream::Stdout);
+
+        let progress = if is_tty {
+            let pb = ProgressBar::new(1);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{bar:40.cyan/blue} {pos}/{len} {msg}")
+                    .unwrap()
+                    .progress_chars("━━╸"),
+            );
+            pb.enable_steady_tick(std::time::Duration::from_millis(100));
+            Some(pb)
+        } else {
+            None
+        };
+
+        let mut deleted_resources = std::collections::HashSet::new();
+        let mut total_resources = 0u64;
+
+        // Wait for the stack deletion to complete
+        if progress.is_none() {
+            info!("Waiting for stack deletion to complete...");
+        }
+
+        loop {
+            let response = self
+                .cfn_client
+                .describe_stacks()
+                .stack_name(&self.stack_name)
+                .send()
+                .await;
+
+            match response {
+                Ok(resp) => {
+                    let stack = resp
+                        .stacks()
+                        .first()
+                        .context("Stack not found in describe_stacks response")?;
+
+                    let status = stack
+                        .stack_status()
+                        .context("Stack does not have a status")?;
+
+                    // Get stack events to track deletion progress
+                    if let Some(ref pb) = progress {
+                        if let Ok(events) = self
+                            .cfn_client
+                            .describe_stack_events()
+                            .stack_name(&self.stack_name)
+                            .send()
+                            .await
+                        {
+                            // Count total unique resources and deleted ones
+                            for event in events.stack_events() {
+                                if let Some(resource_id) = event.logical_resource_id() {
+                                    // Skip the stack itself
+                                    if resource_id == self.stack_name {
+                                        continue;
+                                    }
+
+                                    // Track total unique resources
+                                    total_resources = total_resources.max(
+                                        events
+                                            .stack_events()
+                                            .iter()
+                                            .filter(|e| {
+                                                e.logical_resource_id()
+                                                    .map_or(false, |id| id != self.stack_name)
+                                            })
+                                            .filter_map(|e| e.logical_resource_id())
+                                            .collect::<std::collections::HashSet<_>>()
+                                            .len() as u64,
+                                    );
+
+                                    // Track deleted resources
+                                    if let Some(status) = event.resource_status() {
+                                        let status_str = status.as_str();
+                                        if status_str == "DELETE_COMPLETE" {
+                                            deleted_resources.insert(resource_id.to_string());
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Update progress bar
+                            if total_resources > 0 {
+                                pb.set_length(total_resources);
+                                pb.set_position(deleted_resources.len() as u64);
+                            }
+
+                            // Show the latest event
+                            if let Some(latest_event) = events.stack_events().first() {
+                                let resource =
+                                    latest_event.logical_resource_id().unwrap_or("Stack");
+                                let event_status = latest_event
+                                    .resource_status()
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("UNKNOWN");
+                                let reason = latest_event.resource_status_reason().unwrap_or("");
+
+                                let msg = if reason.is_empty() {
+                                    format!("{}: {}", resource, event_status)
+                                } else {
+                                    format!("{}: {} - {}", resource, event_status, reason)
+                                };
+                                pb.set_message(msg);
+                            }
+                        }
+                    } else {
+                        info!("Stack deletion status: {:?}", status);
+                    }
+
+                    use aws_sdk_cloudformation::types::StackStatus;
+                    match status {
+                        StackStatus::DeleteComplete => {
+                            if let Some(pb) = progress {
+                                pb.finish_with_message("Stack deletion completed successfully");
+                            } else {
+                                info!("Stack deletion completed successfully");
+                            }
+                            return Ok(());
+                        }
+                        StackStatus::DeleteInProgress => {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        }
+                        StackStatus::DeleteFailed => {
+                            let reason = stack.stack_status_reason().unwrap_or("Unknown reason");
+                            if let Some(pb) = progress {
+                                pb.finish_with_message(format!(
+                                    "Stack deletion failed: {}",
+                                    reason
+                                ));
+                            }
+                            bail!("Stack deletion failed: {}", reason);
+                        }
+                        _ => {
+                            let reason = stack.stack_status_reason().unwrap_or("Unknown reason");
+                            if let Some(pb) = progress {
+                                pb.finish_with_message(format!(
+                                    "Unexpected stack status: {} - {}",
+                                    status.as_str(),
+                                    reason
+                                ));
+                            }
+                            bail!(
+                                "Unexpected stack status during deletion: {} - {}",
+                                status.as_str(),
+                                reason
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    // If the stack doesn't exist anymore, that's actually success
+                    // Check for various error conditions that indicate the stack is gone
+                    let error_str = format!("{:?}", e);
+                    if error_str.contains("ValidationError")
+                        || error_str.contains("does not exist")
+                        || error_str.contains("Stack with id")
+                    {
+                        if let Some(pb) = progress {
+                            pb.finish_with_message("Stack has been deleted");
+                        } else {
+                            info!("Stack has been deleted (no longer queryable)");
+                        }
+                        return Ok(());
+                    }
+                    // Log the actual error for debugging
+                    tracing::warn!("Unexpected error checking stack deletion status: {:?}", e);
+                    return Err(e).context("Failed to check stack deletion status");
+                }
+            }
+        }
     }
 }
