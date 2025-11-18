@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use anyhow::{bail, Result};
 use clap::Parser;
 use config::{CommandLine, ServiceConfig};
@@ -55,14 +57,23 @@ async fn main() -> Result<ExitCode> {
             });
         }
         #[cfg(feature = "aws")]
-        ServiceConfig::Aws { hosted_zone_id, instance_type, debug, .. } => {
+        ServiceConfig::Aws {
+            hosted_zone_id,
+            instance_type,
+            debug,
+            use_cloudfront,
+            ..
+        } => {
+            // Validate CloudFront configuration
+            service_config.validate_cloudfront()?;
+
             let ingress = service_config.ingress()?;
             let origin = service_config.origin()?;
             let regions = service_config.aws_regions().unwrap_or_default();
             let hosted_zone_id = hosted_zone_id.clone();
             let instance_type = instance_type.clone();
             let debug = *debug;
-            let region = regions.first().cloned().unwrap_or_default();
+            let use_cloudfront = *use_cloudfront;
 
             // Set up graceful shutdown handler early using a broadcast channel
             let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
@@ -102,6 +113,10 @@ async fn main() -> Result<ExitCode> {
             // Generate WireGuard keys for both sides
             let wg_keys = crate::wireguard::WireGuardPair::generate().await?;
 
+            // Determine available WireGuard tunnel IPs before deployment
+            info!("Finding available IP range for WireGuard tunnel...");
+            let (wg_proxy_ip, wg_origin_ip) = crate::wireguard::find_available_subnet().await?;
+
             // Get the public IP of this machine (origin)
             info!("Detecting origin IP address...");
             let origin_ip = tokio::select! {
@@ -118,7 +133,7 @@ async fn main() -> Result<ExitCode> {
 
             // Deploy the AWS proxy
             let mut shutdown_rx2 = shutdown_rx.resubscribe();
-            let proxy = tokio::select! {
+            let mut proxy = tokio::select! {
                 result = crate::aws::AwsProxy::deploy(
                     ingress.host.clone(),
                     ingress.port,
@@ -134,6 +149,9 @@ async fn main() -> Result<ExitCode> {
                     wg_keys.origin.preshared_key.clone(),
                     hosted_zone_id,
                     debug,
+                    use_cloudfront,
+                    wg_proxy_ip.clone(),
+                    wg_origin_ip.clone(),
                 ) => result?,
                 _ = shutdown_rx2.recv() => {
                     info!("Shutdown signal received during deployment");
@@ -166,6 +184,8 @@ async fn main() -> Result<ExitCode> {
                     wg_keys.origin,
                     wg_keys.proxy.public_key,
                     proxy_endpoint,
+                    wg_proxy_ip,
+                    wg_origin_ip,
                 ) => result?,
                 _ = shutdown_rx4.recv() => {
                     info!("Shutdown signal received during tunnel setup");
@@ -186,14 +206,22 @@ async fn main() -> Result<ExitCode> {
             {
                 let mut proxy_info = state.proxy_info.write().await;
                 *proxy_info = Some(crate::api::ProxyInfo::Aws {
-                    instance_id: "".to_string(), // Will be fetched later
+                    instance_id: proxy.instance_id.clone(),
                     instance_type,
-                    region,
+                    region: proxy.region.clone(),
                     public_ip: proxy_ip.clone(),
-                    private_ip: "172.17.0.1".to_string(),
+                    private_ip: tunnel.proxy_ip.clone(),
                     state: "running".to_string(),
-                    launch_time: "".to_string(), // Will be fetched later
+                    launch_time: proxy.launch_time.clone(),
+                    uptime: String::new(), // Will be calculated dynamically in the dashboard
                 });
+            }
+
+            // CloudFront info will be available in CloudFormation outputs if enabled
+            // The distribution is managed by CloudFormation, not directly
+            if use_cloudfront {
+                info!("CloudFront distribution is being created by CloudFormation");
+                info!("Distribution will be ready in approximately 15-20 minutes");
             }
 
             // Mark tunnel as up

@@ -1,5 +1,7 @@
 use anyhow::{bail, Context, Result};
+use std::collections::HashSet;
 use std::fs;
+use std::net::Ipv4Addr;
 use tempfile::TempDir;
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
@@ -87,10 +89,78 @@ impl WireGuardPair {
     }
 }
 
+/// Get all existing IP subnets on the system to avoid collisions
+async fn get_existing_subnets() -> Result<HashSet<String>> {
+    use nix::ifaddrs::getifaddrs;
+
+    let mut subnets = HashSet::new();
+
+    // Use getifaddrs to get all network interface addresses
+    let ifaddrs = getifaddrs().context("Failed to get network interface addresses")?;
+
+    for ifaddr in ifaddrs {
+        if let Some(address) = ifaddr.address {
+            if let Some(sock_addr) = address.as_sockaddr_in() {
+                let ip_addr = Ipv4Addr::from(sock_addr.ip());
+                let octets = ip_addr.octets();
+                // Store the first two octets as the network identifier
+                subnets.insert(format!("{}.{}", octets[0], octets[1]));
+            }
+        }
+    }
+
+    debug!("Found existing subnets: {:?}", subnets);
+    Ok(subnets)
+}
+
+/// Find an available /24 subnet for WireGuard that doesn't conflict with existing networks
+/// Returns a tuple of (proxy_ip, origin_ip)
+pub async fn find_available_subnet() -> Result<(String, String)> {
+    let existing = get_existing_subnets().await?;
+
+    // Try common private IP ranges in order of preference
+    // Format: (network_prefix, proxy_ip, origin_ip)
+    let candidates = vec![
+        ("172.17", "172.17.0.1", "172.17.0.2"), // Docker default
+        ("172.18", "172.18.0.1", "172.18.0.2"),
+        ("172.19", "172.19.0.1", "172.19.0.2"),
+        ("172.20", "172.20.0.1", "172.20.0.2"),
+        ("172.21", "172.21.0.1", "172.21.0.2"),
+        ("172.22", "172.22.0.1", "172.22.0.2"),
+        ("172.23", "172.23.0.1", "172.23.0.2"),
+        ("172.24", "172.24.0.1", "172.24.0.2"),
+        ("172.25", "172.25.0.1", "172.25.0.2"),
+        ("172.26", "172.26.0.1", "172.26.0.2"),
+        ("172.27", "172.27.0.1", "172.27.0.2"),
+        ("172.28", "172.28.0.1", "172.28.0.2"),
+        ("172.29", "172.29.0.1", "172.29.0.2"),
+        ("172.30", "172.30.0.1", "172.30.0.2"),
+        ("172.31", "172.31.0.1", "172.31.0.2"),
+        ("10.99", "10.99.0.1", "10.99.0.2"),
+        ("10.98", "10.98.0.1", "10.98.0.2"),
+        ("10.97", "10.97.0.1", "10.97.0.2"),
+        ("192.168.99", "192.168.99.1", "192.168.99.2"),
+    ];
+
+    for (prefix, proxy_ip, origin_ip) in candidates {
+        if !existing.contains(prefix) {
+            info!(
+                "Selected WireGuard subnet: {}.0.0/24 (proxy: {}, origin: {})",
+                prefix, proxy_ip, origin_ip
+            );
+            return Ok((proxy_ip.to_string(), origin_ip.to_string()));
+        }
+    }
+
+    bail!("Could not find an available IP subnet for WireGuard. All candidate ranges are in use.");
+}
+
 pub struct OriginTunnel {
     _temp: TempDir,
     config_path: std::path::PathBuf,
     interface_up: bool,
+    pub proxy_ip: String,
+    pub origin_ip: String,
 }
 
 impl OriginTunnel {
@@ -109,26 +179,33 @@ impl OriginTunnel {
         origin_keys: WireGuardKeys,
         proxy_public_key: String,
         proxy_endpoint: String,
+        proxy_ip: String,
+        origin_ip: String,
     ) -> Result<Self> {
         info!("Setting up WireGuard tunnel on origin");
 
         let temp = TempDir::new()?;
         let config_path = temp.path().join("wg0.conf");
 
-        // Create WireGuard configuration
+        // Create WireGuard configuration with dynamically selected IPs
         let config = format!(
             r#"[Interface]
-Address = 172.17.0.2/24
+Address = {}/24
 PrivateKey = {}
 
 [Peer]
 PublicKey = {}
 PresharedKey = {}
 Endpoint = {}
-AllowedIPs = 172.17.0.1/32
+AllowedIPs = {}/32
 PersistentKeepalive = 25
 "#,
-            origin_keys.private_key, proxy_public_key, origin_keys.preshared_key, proxy_endpoint
+            origin_ip,
+            origin_keys.private_key,
+            proxy_public_key,
+            origin_keys.preshared_key,
+            proxy_endpoint,
+            proxy_ip
         );
 
         fs::write(&config_path, config).context("Failed to write WireGuard configuration")?;
@@ -136,11 +213,7 @@ PersistentKeepalive = 25
         debug!("WireGuard configuration written to {:?}", config_path);
 
         // Check if wg-quick is available
-        match Command::new("which")
-            .arg("wg-quick")
-            .output()
-            .await
-        {
+        match Command::new("which").arg("wg-quick").output().await {
             Ok(output) if output.status.success() => {
                 debug!("wg-quick found, attempting to bring up tunnel");
             }
@@ -164,7 +237,10 @@ PersistentKeepalive = 25
             .context("Failed to execute wg-quick")?;
 
         if !status.success() {
-            error!("wg-quick failed to bring up the tunnel (exit code: {})", status);
+            error!(
+                "wg-quick failed to bring up the tunnel (exit code: {})",
+                status
+            );
             error!("This usually means:");
             error!("  1. The application is not running with root privileges");
             error!("  2. Another WireGuard interface is already active");
@@ -181,6 +257,8 @@ PersistentKeepalive = 25
             config_path: config_path.to_path_buf(),
             _temp: temp,
             interface_up: true,
+            proxy_ip,
+            origin_ip,
         })
     }
 }
@@ -206,7 +284,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_key_generation() {
-        let keys = WireGuardKeys::generate().await.expect("Failed to generate keys");
+        let keys = WireGuardKeys::generate()
+            .await
+            .expect("Failed to generate keys");
 
         // Keys should be base64 encoded and not empty
         assert!(!keys.private_key.is_empty());
@@ -216,7 +296,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_key_pair_generation() {
-        let pair = WireGuardPair::generate().await.expect("Failed to generate key pair");
+        let pair = WireGuardPair::generate()
+            .await
+            .expect("Failed to generate key pair");
 
         // Both sides should have valid keys
         assert!(!pair.origin.private_key.is_empty());

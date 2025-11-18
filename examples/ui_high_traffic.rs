@@ -4,8 +4,8 @@ use outpost::api::{IndexTemplate, ProxyInfo, TunnelStats};
 
 async fn index() -> Html<String> {
     let mut stats = TunnelStats {
-        bytes_sent: 500_000_000_000,        // 465 GB
-        bytes_received: 1_200_000_000_000,  // 1.09 TB
+        bytes_sent: 500_000_000_000,       // 465 GB
+        bytes_received: 1_200_000_000_000, // 1.09 TB
         bytes_sent_formatted: String::new(),
         bytes_received_formatted: String::new(),
         packets_sent: 5_678_901,
@@ -22,12 +22,14 @@ async fn index() -> Html<String> {
         public_ip: "198.51.100.123".to_string(),
         private_ip: "172.17.0.1".to_string(),
         state: "running".to_string(),
-        launch_time: "2025-10-12 08:15:00 UTC".to_string(),
+        launch_time: "2025-10-12T08:15:00Z".to_string(),
+        uptime: String::new(), // Will be calculated dynamically
     });
 
     let template = IndexTemplate {
         tunnel_stats: stats,
         proxy_info,
+        cloudfront_info: None,
     };
 
     Html(template.render().unwrap())

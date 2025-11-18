@@ -12,7 +12,10 @@ use tracing::{debug, info};
 pub struct AwsProxy {
     pub stack_name: String,
     pub region: String,
+    pub instance_id: String,
+    pub launch_time: String,
     cfn_client: CfnClient,
+    ec2_client: Ec2Client,
 }
 
 /// Validates that the hosted zone exists and the ingress host is a subdomain of
@@ -151,6 +154,9 @@ impl AwsProxy {
         preshared_key: String,
         hosted_zone_id: String,
         debug: bool,
+        use_cloudfront: bool,
+        wg_proxy_ip: String,
+        wg_origin_ip: String,
     ) -> Result<Self> {
         // Use the first region in the list, or fall back to defaults
         let region = regions
@@ -191,6 +197,9 @@ impl AwsProxy {
             origin_wg_public_key,
             preshared_key,
             debug,
+            use_cloudfront,
+            wg_proxy_ip,
+            wg_origin_ip,
         };
 
         let template_body = template.generate()?;
@@ -228,12 +237,37 @@ impl AwsProxy {
         Ok(Self {
             stack_name,
             region,
+            instance_id: String::new(), // Will be populated after stack completion
+            launch_time: String::new(), // Will be populated after stack completion
             cfn_client,
+            ec2_client,
         })
     }
 
-    /// Wait for the CloudFormation stack to complete deployment
-    pub async fn wait_for_completion(&self) -> Result<String> {
+    /// Fetch the launch time of an EC2 instance
+    async fn fetch_launch_time(&self, instance_id: &str) -> Result<String> {
+        let response = self
+            .ec2_client
+            .describe_instances()
+            .instance_ids(instance_id)
+            .send()
+            .await
+            .context("Failed to describe EC2 instance")?;
+
+        let launch_time = response
+            .reservations()
+            .iter()
+            .flat_map(|r| r.instances())
+            .next()
+            .and_then(|instance| instance.launch_time())
+            .map(|dt| dt.to_string())
+            .context("Launch time not found for instance")?;
+
+        Ok(launch_time)
+    }
+
+    /// Wait for the CloudFormation stack to complete deployment and fetch instance metadata
+    pub async fn wait_for_completion(&mut self) -> Result<String> {
         info!(
             "Waiting for CloudFormation stack to complete: {}",
             self.stack_name
@@ -260,13 +294,29 @@ impl AwsProxy {
         let mut total_resources = 0u64;
 
         loop {
-            let response = self
+            let response = match self
                 .cfn_client
                 .describe_stacks()
                 .stack_name(&self.stack_name)
                 .send()
                 .await
-                .context("Failed to describe CloudFormation stack")?;
+            {
+                Ok(resp) => resp,
+                Err(err) => {
+                    // Check if the error is a ValidationError indicating the stack doesn't exist
+                    // This can happen when OnFailure::Delete causes the stack to be auto-deleted
+                    let err_str = format!("{:?}", err);
+                    if err_str.contains("ValidationError") && err_str.contains("does not exist") {
+                        return Err(anyhow::anyhow!(
+                            "CloudFormation stack '{}' does not exist. \
+                            This likely means the stack creation failed and was automatically deleted. \
+                            Check the CloudFormation events in the AWS Console for failure details.",
+                            self.stack_name
+                        ));
+                    }
+                    return Err(err).context("Failed to describe CloudFormation stack");
+                }
+            };
 
             let stack = response
                 .stacks()
@@ -364,7 +414,24 @@ impl AwsProxy {
                         .and_then(|output| output.output_value())
                         .context("ProxyPublicIP output not found in stack")?;
 
+                    // Extract the instance ID from outputs
+                    let instance_id = stack
+                        .outputs()
+                        .iter()
+                        .find(|output| output.output_key() == Some("ProxyInstanceId"))
+                        .and_then(|output| output.output_value())
+                        .context("ProxyInstanceId output not found in stack")?;
+
                     info!("Proxy public IP: {}", proxy_ip);
+                    info!("Proxy instance ID: {}", instance_id);
+
+                    // Fetch launch time from EC2
+                    let launch_time = self.fetch_launch_time(instance_id).await?;
+
+                    // Store instance metadata
+                    self.instance_id = instance_id.to_string();
+                    self.launch_time = launch_time;
+
                     return Ok(proxy_ip.to_string());
                 }
                 StackStatus::CreateInProgress | StackStatus::DeleteInProgress => {

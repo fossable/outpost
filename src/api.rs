@@ -18,6 +18,7 @@ struct Assets;
 pub struct AppState {
     pub stats: Arc<RwLock<TunnelStats>>,
     pub proxy_info: Arc<RwLock<Option<ProxyInfo>>>,
+    pub cloudfront_info: Arc<RwLock<Option<CloudFrontInfo>>>,
 }
 
 #[derive(Clone, Default)]
@@ -72,6 +73,31 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Calculate uptime from a launch time string in RFC3339 format
+pub fn calculate_uptime(launch_time: &str) -> String {
+    use chrono::{DateTime, Utc};
+
+    // Try to parse the launch time
+    if let Ok(launch) = DateTime::parse_from_rfc3339(launch_time) {
+        let now = Utc::now();
+        let duration = now.signed_duration_since(launch.with_timezone(&Utc));
+
+        let days = duration.num_days();
+        let hours = duration.num_hours() % 24;
+        let minutes = duration.num_minutes() % 60;
+
+        if days > 0 {
+            format!("{}d {}h {}m", days, hours, minutes)
+        } else if hours > 0 {
+            format!("{}h {}m", hours, minutes)
+        } else {
+            format!("{}m", minutes)
+        }
+    } else {
+        "Unknown".to_string()
+    }
+}
+
 #[derive(Clone)]
 pub enum ProxyInfo {
     Aws {
@@ -82,6 +108,7 @@ pub enum ProxyInfo {
         private_ip: String,
         state: String,
         launch_time: String,
+        uptime: String,
     },
     Cloudflare {
         hostname: String,
@@ -101,6 +128,7 @@ impl ProxyInfo {
             private_ip: "172.17.0.1".to_string(),
             state: "running".to_string(),
             launch_time: "2025-11-11 19:30:00 UTC".to_string(),
+            uptime: "2h 15m".to_string(),
         }
     }
 
@@ -114,11 +142,30 @@ impl ProxyInfo {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct CloudFrontInfo {
+    pub distribution_id: String,
+    pub distribution_domain: String,
+    pub status: String,
+}
+
+impl CloudFrontInfo {
+    /// Create example CloudFront info for demo mode
+    pub fn example() -> Self {
+        CloudFrontInfo {
+            distribution_id: "E1234ABCDEFGHI".to_string(),
+            distribution_domain: "d1234abcdefghi.cloudfront.net".to_string(),
+            status: "Deployed".to_string(),
+        }
+    }
+}
+
 #[derive(Template)]
 #[template(path = "index.html")]
 pub struct IndexTemplate {
     pub tunnel_stats: TunnelStats,
     pub proxy_info: Option<ProxyInfo>,
+    pub cloudfront_info: Option<CloudFrontInfo>,
 }
 
 pub async fn assets(axum::extract::Path(file): axum::extract::Path<String>) -> Response {
@@ -148,11 +195,23 @@ pub fn router(state: AppState) -> Router {
 pub async fn index(State(state): State<AppState>) -> impl IntoResponse {
     let mut stats = state.stats.read().await.clone();
     stats.format_sizes();
-    let proxy_info = state.proxy_info.read().await.clone();
+    let mut proxy_info = state.proxy_info.read().await.clone();
+    let cloudfront_info = state.cloudfront_info.read().await.clone();
+
+    // Calculate uptime dynamically for AWS proxy
+    if let Some(ProxyInfo::Aws {
+        launch_time,
+        uptime,
+        ..
+    }) = &mut proxy_info
+    {
+        *uptime = calculate_uptime(launch_time);
+    }
 
     let template = IndexTemplate {
         tunnel_stats: stats,
         proxy_info,
+        cloudfront_info,
     };
 
     Html(template.render().unwrap())

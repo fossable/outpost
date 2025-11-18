@@ -236,7 +236,7 @@
 
         {% if let Some(info) = proxy_info %}
             {% match info %}
-                {% when ProxyInfo::Aws with { instance_id, instance_type, region, public_ip, private_ip, state, launch_time } %}
+                {% when ProxyInfo::Aws with { instance_id, instance_type, region, public_ip, private_ip, state, launch_time, uptime } %}
                     <div class="proxy-block">
                         <div class="proxy-header">AWS Proxy Instance</div>
                         <div class="proxy-details">
@@ -268,6 +268,10 @@
                                 <div class="proxy-item-label">Launch Time</div>
                                 <div class="proxy-item-value">{{ launch_time }}</div>
                             </div>
+                            <div class="proxy-item">
+                                <div class="proxy-item-label">Uptime</div>
+                                <div class="proxy-item-value">{{ uptime }}</div>
+                            </div>
                         </div>
                     </div>
                 {% when ProxyInfo::Cloudflare with { hostname, connector_id, connections } %}
@@ -289,6 +293,33 @@
                         </div>
                     </div>
             {% endmatch %}
+        {% endif %}
+
+        {% if let Some(cf_info) = cloudfront_info %}
+            <div class="proxy-block">
+                <div class="proxy-header">CloudFront Distribution</div>
+                <div class="proxy-details">
+                    <div class="proxy-item">
+                        <div class="proxy-item-label">Distribution ID</div>
+                        <div class="proxy-item-value">{{ cf_info.distribution_id }}</div>
+                    </div>
+                    <div class="proxy-item">
+                        <div class="proxy-item-label">Domain</div>
+                        <div class="proxy-item-value">
+                            <a href="https://{{ cf_info.distribution_domain }}" class="link" target="_blank">{{ cf_info.distribution_domain }}</a>
+                        </div>
+                    </div>
+                    <div class="proxy-item">
+                        <div class="proxy-item-label">Status</div>
+                        <div class="proxy-item-value">{{ cf_info.status }}</div>
+                    </div>
+                </div>
+                {% if cf_info.status == "InProgress" %}
+                    <div class="stat-detail" style="margin-top: 16px;">
+                        Distribution is deploying. This typically takes 15-20 minutes to complete.
+                    </div>
+                {% endif %}
+            </div>
         {% endif %}
     </div>
 </body>

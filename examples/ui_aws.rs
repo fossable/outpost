@@ -22,12 +22,14 @@ async fn index() -> Html<String> {
         public_ip: "203.0.113.42".to_string(),
         private_ip: "172.17.0.1".to_string(),
         state: "running".to_string(),
-        launch_time: "2025-11-11 19:30:00 UTC".to_string(),
+        launch_time: "2025-11-11T19:30:00Z".to_string(),
+        uptime: String::new(), // Will be calculated dynamically
     });
 
     let template = IndexTemplate {
         tunnel_stats: stats,
         proxy_info,
+        cloudfront_info: None,
     };
 
     Html(template.render().unwrap())

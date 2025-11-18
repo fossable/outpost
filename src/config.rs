@@ -90,6 +90,10 @@ pub enum ServiceConfig {
         /// Enable debug mode (allows SSH access to proxy instance with hardcoded password)
         #[clap(long, env = "OUTPOST_AWS_DEBUG")]
         debug: bool,
+
+        /// Use CloudFront distribution (port 443 only)
+        #[clap(long, env = "OUTPOST_AWS_USE_CLOUDFRONT")]
+        use_cloudfront: bool,
     },
 }
 
@@ -123,6 +127,31 @@ impl ServiceConfig {
             }
             #[cfg(feature = "cloudflare")]
             _ => None,
+        }
+    }
+
+    /// Validate CloudFront configuration
+    #[cfg(feature = "aws")]
+    pub fn validate_cloudfront(&self) -> Result<()> {
+        match self {
+            ServiceConfig::Aws {
+                use_cloudfront,
+                ingress,
+                ..
+            } => {
+                if *use_cloudfront {
+                    let endpoint = Endpoint::parse(ingress)?;
+                    if endpoint.port != 443 {
+                        anyhow::bail!(
+                            "CloudFront can only be used with port 443, but ingress port is {}",
+                            endpoint.port
+                        );
+                    }
+                }
+                Ok(())
+            }
+            #[cfg(feature = "cloudflare")]
+            _ => Ok(()),
         }
     }
 }

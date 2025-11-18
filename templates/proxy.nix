@@ -11,45 +11,56 @@ in {
   # Enable IP forwarding
   boot.kernel.sysctl = { "net.ipv4.ip_forward" = 1; };
 
-  # Install required packages
+  # Install only essential packages (keep minimal)
   environment.systemPackages = with pkgs; [
     wireguard-tools
     iptables
     curl
-    jq
     awscli2
-    ec2-instance-connect
   ];
+
+  # Don't install default packages
+  environment.defaultPackages = [ ];
 
   # Configure WireGuard
   networking.wireguard.interfaces.wg0 = {
-    ips = [ "172.17.0.1/24" ];
+    ips = [ "{PROXY_IP}/24" ];
     listenPort = 51820;
     privateKey = "{PROXY_WG_PRIVATE_KEY}";
 
     # Set up NAT rules for port forwarding
     postSetup = ''
-      ${pkgs.iptables}/bin/iptables -t nat -A PREROUTING -p {PROTOCOL} --dport {INGRESS_PORT} -j DNAT --to-destination 172.17.0.2:{ORIGIN_PORT}
-      ${pkgs.iptables}/bin/iptables -t nat -A POSTROUTING -s 172.17.0.0/24 -j MASQUERADE
+      ${pkgs.iptables}/bin/iptables -t nat -A PREROUTING -p {PROTOCOL} --dport {INGRESS_PORT} -j DNAT --to-destination {ORIGIN_IP}:{ORIGIN_PORT}
+      ${pkgs.iptables}/bin/iptables -t nat -A POSTROUTING -s {SUBNET}/24 -j MASQUERADE
     '';
 
     postShutdown = ''
-      ${pkgs.iptables}/bin/iptables -t nat -D PREROUTING -p {PROTOCOL} --dport {INGRESS_PORT} -j DNAT --to-destination 172.17.0.2:{ORIGIN_PORT} || true
-      ${pkgs.iptables}/bin/iptables -t nat -D POSTROUTING -s 172.17.0.0/24 -j MASQUERADE || true
+      ${pkgs.iptables}/bin/iptables -t nat -D PREROUTING -p {PROTOCOL} --dport {INGRESS_PORT} -j DNAT --to-destination {ORIGIN_IP}:{ORIGIN_PORT} || true
+      ${pkgs.iptables}/bin/iptables -t nat -D POSTROUTING -s {SUBNET}/24 -j MASQUERADE || true
     '';
 
     peers = [{
       publicKey = "{ORIGIN_WG_PUBLIC_KEY}";
       presharedKey = "{PRESHARED_KEY}";
-      allowedIPs = [ "172.17.0.2/32" ];
+      allowedIPs = [ "{ORIGIN_IP}/32" ];
       persistentKeepalive = 25;
     }];
   };
 
-  services.openssh = lib.mkForce false;
+  services = {
+    openssh = {
+      enable = lib.mkForce debug;
+      settings.PasswordAuthentication = lib.mkForce true;
+      settings.PermitRootLogin = lib.mkForce "yes";
+    };
+    amazon-ssm-agent.enable = pkgs.lib.mkForce false;
+  };
 
-  users.users.root.password = lib.mkIf debug "outpost-debug";
-  users.mutableUsers = false;
+  users = {
+    mutableUsers = false;
+    allowNoPasswordLogin = !debug;
+    users.root.password = lib.mkIf debug "outpost-debug";
+  };
 
   # Create self-destruct monitoring service
   systemd.services.outpost-monitor = {
@@ -65,15 +76,12 @@ in {
     };
 
     script = ''
-      ORIGIN_IP="{ORIGIN_IP}"
-      STACK_NAME="{STACK_NAME}"
-      REGION="{REGION}"
       FAIL_COUNT=0
       MAX_FAILS=60  # 5 minutes with 5-second checks
 
       while true; do
         # Try to ping the origin through the WireGuard tunnel
-        if ${pkgs.iputils}/bin/ping -c 1 -W 2 172.17.0.2 > /dev/null 2>&1; then
+        if ${pkgs.iputils}/bin/ping -c 1 -W 2 {ORIGIN_IP} > /dev/null 2>&1; then
           FAIL_COUNT=0
         else
           FAIL_COUNT=$((FAIL_COUNT + 1))
@@ -81,7 +89,7 @@ in {
 
           if [ $FAIL_COUNT -ge $MAX_FAILS ]; then
             echo "$(date): Origin unreachable for 5 minutes. Self-destructing..."
-            ${pkgs.awscli2}/bin/aws cloudformation delete-stack --stack-name "$STACK_NAME" --region "$REGION"
+            ${pkgs.awscli2}/bin/aws cloudformation delete-stack --stack-name "{STACK_NAME}" --region "{REGION}"
             exit 0
           fi
         fi
@@ -94,9 +102,9 @@ in {
   # Signal CloudFormation on first boot
   systemd.services.cloudformation-signal = {
     description = "Signal CloudFormation that initialization is complete";
-    after = [ "network.target" "wireguard-wg0.service" ];
+    # after = [ "network.target" "wireguard-wg0.service" ];
     requires = [ "wireguard-wg0.service" ];
-    wantedBy = [ "multi-user.target" ];
+    # wantedBy = [ "multi-user.target" ];
 
     serviceConfig = {
       Type = "oneshot";
@@ -104,16 +112,11 @@ in {
     };
 
     script = ''
-      # Get the instance ID from EC2 metadata
-      INSTANCE_ID=$(${pkgs.curl}/bin/curl -s http://169.254.169.254/latest/meta-data/instance-id)
-      REGION="{REGION}"
-      STACK_NAME="{STACK_NAME}"
-
       # Query CloudFormation to get the WaitHandle URL
       WAIT_HANDLE_URL=$(${pkgs.awscli2}/bin/aws cloudformation describe-stack-resource \
-        --stack-name "$STACK_NAME" \
+        --stack-name "{STACK_NAME}" \
         --logical-resource-id WaitHandle \
-        --region "$REGION" \
+        --region "{REGION}" \
         --query 'StackResourceDetail.PhysicalResourceId' \
         --output text)
 
@@ -123,6 +126,23 @@ in {
         "$WAIT_HANDLE_URL"
     '';
   };
+
+  # Disable unnecessary services and features
+  security.sudo.enable = false;
+  networking.firewall.enable = false;
+
+  # Disable documentation to save space
+  documentation.enable = false;
+  documentation.man.enable = false;
+  documentation.info.enable = false;
+  documentation.doc.enable = false;
+  documentation.nixos.enable = false;
+
+  # Reduce journal size
+  services.journald.extraConfig = ''
+    SystemMaxUse=100M
+    MaxRetentionSec=1day
+  '';
 
   system.stateVersion = "25.05";
 }

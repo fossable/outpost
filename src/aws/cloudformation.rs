@@ -16,11 +16,14 @@ pub struct CloudFormationTemplate {
     pub origin_wg_public_key: String,
     pub preshared_key: String,
     pub debug: bool,
+    pub use_cloudfront: bool,
+    pub wg_proxy_ip: String,
+    pub wg_origin_ip: String,
 }
 
 impl CloudFormationTemplate {
     pub fn generate(&self) -> Result<String> {
-        let template = json!({
+        let template_obj = json!({
             "AWSTemplateFormatVersion": "2010-09-09",
             "Description": "Outpost AWS Proxy with VPC, WireGuard, and self-destruct",
 
@@ -32,6 +35,17 @@ impl CloudFormationTemplate {
                 "NixOSAMI": {
                     "Type": "AWS::EC2::Image::Id",
                     "Description": "NixOS AMI ID"
+                }
+            },
+
+            "Conditions": {
+                "UseCloudFront": {
+                    "Fn::Equals": [self.use_cloudfront, true]
+                },
+                "NotUseCloudFront": {
+                    "Fn::Not": [{
+                        "Fn::Equals": [self.use_cloudfront, true]
+                    }]
                 }
             },
 
@@ -207,9 +221,10 @@ impl CloudFormationTemplate {
                     }
                 },
 
-                // Route53 DNS Record
-                "DNSRecord": {
+                // Route53 DNS Record (direct to EC2, no CloudFront)
+                "DirectDNSRecord": {
                     "Type": "AWS::Route53::RecordSet",
+                    "Condition": "NotUseCloudFront",
                     "DependsOn": "WaitCondition",
                     "Properties": {
                         "HostedZoneId": {"Ref": "HostedZoneId"},
@@ -217,6 +232,66 @@ impl CloudFormationTemplate {
                         "Type": "A",
                         "TTL": "60",
                         "ResourceRecords": [{"Fn::GetAtt": ["ProxyInstance", "PublicIp"]}]
+                    }
+                },
+
+                // CloudFront Distribution (optional)
+                "CloudFrontDistribution": {
+                    "Type": "AWS::CloudFront::Distribution",
+                    "Condition": "UseCloudFront",
+                    "DependsOn": "WaitCondition",
+                    "Properties": {
+                        "DistributionConfig": {
+                            "Comment": "Outpost CloudFront distribution",
+                            "Enabled": true,
+                            "HttpVersion": "http2",
+                            "Origins": [{
+                                "Id": "outpost-ec2-origin",
+                                "DomainName": {"Fn::GetAtt": ["ProxyInstance", "PublicIp"]},
+                                "CustomOriginConfig": {
+                                    "HTTPPort": 80,
+                                    "HTTPSPort": 443,
+                                    "OriginProtocolPolicy": "https-only",
+                                    "OriginSSLProtocols": ["TLSv1.2"],
+                                    "OriginReadTimeout": 30,
+                                    "OriginKeepaliveTimeout": 5
+                                }
+                            }],
+                            "DefaultCacheBehavior": {
+                                "TargetOriginId": "outpost-ec2-origin",
+                                "ViewerProtocolPolicy": "https-only",
+                                "AllowedMethods": ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"],
+                                "CachedMethods": ["GET", "HEAD"],
+                                "Compress": true,
+                                "ForwardedValues": {
+                                    "QueryString": true,
+                                    "Headers": ["*"],
+                                    "Cookies": {
+                                        "Forward": "all"
+                                    }
+                                },
+                                "MinTTL": 0,
+                                "DefaultTTL": 0,
+                                "MaxTTL": 0
+                            }
+                        }
+                    }
+                },
+
+                // Route53 DNS Record (with CloudFront)
+                "CloudFrontDNSRecord": {
+                    "Type": "AWS::Route53::RecordSet",
+                    "Condition": "UseCloudFront",
+                    "DependsOn": "CloudFrontDistribution",
+                    "Properties": {
+                        "HostedZoneId": {"Ref": "HostedZoneId"},
+                        "Name": format!("{}.", self.ingress_host),
+                        "Type": "A",
+                        "AliasTarget": {
+                            "HostedZoneId": "Z2FDTNDATAQYW2",
+                            "DNSName": {"Fn::GetAtt": ["CloudFrontDistribution", "DomainName"]},
+                            "EvaluateTargetHealth": false
+                        }
                     }
                 }
             },
@@ -226,18 +301,32 @@ impl CloudFormationTemplate {
                     "Description": "Public IP of the proxy instance",
                     "Value": {"Fn::GetAtt": ["ProxyInstance", "PublicIp"]}
                 },
+                "ProxyInstanceId": {
+                    "Description": "Instance ID of the proxy",
+                    "Value": {"Ref": "ProxyInstance"}
+                },
                 "DNSName": {
                     "Description": "DNS name for the proxy",
                     "Value": self.ingress_host.clone()
+                },
+                "CloudFrontDistributionId": {
+                    "Condition": "UseCloudFront",
+                    "Description": "CloudFront distribution ID",
+                    "Value": {"Ref": "CloudFrontDistribution"}
+                },
+                "CloudFrontDomain": {
+                    "Condition": "UseCloudFront",
+                    "Description": "CloudFront distribution domain name",
+                    "Value": {"Fn::GetAtt": ["CloudFrontDistribution", "DomainName"]}
                 }
             }
         });
 
-        Ok(serde_json::to_string_pretty(&template)?)
+        Ok(serde_json::to_string_pretty(&template_obj)?)
     }
 
     fn generate_security_group_rules(&self) -> serde_json::Value {
-        let rules = vec![
+        let mut rules = vec![
             json!({
                 "IpProtocol": "udp",
                 "FromPort": 51820,
@@ -253,6 +342,16 @@ impl CloudFormationTemplate {
                 "Description": "Ingress traffic"
             }),
         ];
+
+        if self.debug {
+            rules.push(json!({
+                "IpProtocol": "tcp",
+                "FromPort": 22,
+                "ToPort": 22,
+                "CidrIp": format!("{}/32", self.origin_ip),
+                "Description": "Debug SSH access from origin"
+            }))
+        }
 
         serde_json::Value::Array(rules)
     }
@@ -279,6 +378,14 @@ impl CloudFormationTemplate {
         // Load the Nix configuration template at compile time
         const NIX_TEMPLATE: &str = include_str!("../../templates/proxy.nix");
 
+        // Extract subnet from proxy IP (e.g., "172.17.0.1" -> "172.17.0.0")
+        let subnet = self
+            .wg_proxy_ip
+            .rsplitn(2, '.')
+            .nth(1)
+            .map(|s| format!("{}.0", s))
+            .unwrap_or_else(|| "172.17.0.0".to_string());
+
         // Replace placeholders in the Nix template
         let nix_config = NIX_TEMPLATE
             .replace(
@@ -291,7 +398,9 @@ impl CloudFormationTemplate {
             .replace("{ORIGIN_PORT}", &self.origin_port.to_string())
             .replace("{ORIGIN_WG_PUBLIC_KEY}", &self.origin_wg_public_key)
             .replace("{PRESHARED_KEY}", &self.preshared_key)
-            .replace("{ORIGIN_IP}", &self.origin_ip)
+            .replace("{ORIGIN_IP}", &self.wg_origin_ip)
+            .replace("{PROXY_IP}", &self.wg_proxy_ip)
+            .replace("{SUBNET}", &subnet)
             .replace("{STACK_NAME}", &self.stack_name)
             .replace("{REGION}", &self.region);
 
@@ -320,6 +429,9 @@ mod tests {
             origin_wg_public_key: "origin_pub".to_string(),
             preshared_key: "preshared".to_string(),
             debug: false,
+            use_cloudfront: false,
+            wg_proxy_ip: "172.17.0.1".to_string(),
+            wg_origin_ip: "172.17.0.2".to_string(),
         };
 
         assert_eq!(template.get_architecture(), "x86_64");
@@ -342,6 +454,9 @@ mod tests {
             origin_wg_public_key: "origin_pub".to_string(),
             preshared_key: "preshared".to_string(),
             debug: false,
+            use_cloudfront: false,
+            wg_proxy_ip: "172.17.0.1".to_string(),
+            wg_origin_ip: "172.17.0.2".to_string(),
         };
 
         assert_eq!(template.get_architecture(), "arm64");
@@ -364,6 +479,9 @@ mod tests {
             origin_wg_public_key: "origin_pub".to_string(),
             preshared_key: "preshared".to_string(),
             debug: false,
+            use_cloudfront: false,
+            wg_proxy_ip: "172.17.0.1".to_string(),
+            wg_origin_ip: "172.17.0.2".to_string(),
         };
 
         let userdata = template.generate_userdata();
@@ -391,6 +509,9 @@ mod tests {
             origin_wg_public_key: "origin_pub".to_string(),
             preshared_key: "preshared".to_string(),
             debug: false,
+            use_cloudfront: false,
+            wg_proxy_ip: "172.17.0.1".to_string(),
+            wg_origin_ip: "172.17.0.2".to_string(),
         };
 
         let userdata = template.generate_userdata();
@@ -418,6 +539,9 @@ mod tests {
             origin_wg_public_key: "origin_pub".to_string(),
             preshared_key: "preshared".to_string(),
             debug: true,
+            use_cloudfront: false,
+            wg_proxy_ip: "172.17.0.1".to_string(),
+            wg_origin_ip: "172.17.0.2".to_string(),
         };
 
         let userdata = template.generate_userdata();
