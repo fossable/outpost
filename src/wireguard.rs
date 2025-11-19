@@ -6,6 +6,31 @@ use tempfile::TempDir;
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
 
+/// Check if the process has NET_ADMIN capability (required for WireGuard and iptables)
+pub async fn check_net_admin_capability() -> Result<bool> {
+    // Try to check capabilities by reading /proc/self/status
+    if let Ok(status) = tokio::fs::read_to_string("/proc/self/status").await {
+        for line in status.lines() {
+            if line.starts_with("CapEff:") {
+                // Extract the effective capabilities hex value
+                if let Some(cap_hex) = line.split_whitespace().nth(1) {
+                    if let Ok(caps) = u64::from_str_radix(cap_hex, 16) {
+                        // NET_ADMIN is bit 12 (0x1000)
+                        const CAP_NET_ADMIN: u64 = 1 << 12;
+                        return Ok((caps & CAP_NET_ADMIN) != 0);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: Try to execute a harmless iptables command to check if we have permission
+    match Command::new("iptables").arg("-L").arg("-n").output().await {
+        Ok(output) => Ok(output.status.success()),
+        Err(_) => Ok(false),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WireGuardKeys {
     pub private_key: String,
@@ -181,6 +206,8 @@ impl OriginTunnel {
         proxy_endpoint: String,
         proxy_ip: String,
         origin_ip: String,
+        origin_host: String,
+        origin_port: u16,
     ) -> Result<Self> {
         info!("Setting up WireGuard tunnel on origin");
 
@@ -188,27 +215,52 @@ impl OriginTunnel {
         let config_path = temp.path().join("wg0.conf");
 
         // Create WireGuard configuration with dynamically selected IPs
+        // The iptables rules implement tight security:
+        // 1. Only accept packets from the specific proxy IP on wg0
+        // 2. Only forward TCP traffic from proxy IP
+        // 3. Only MASQUERADE traffic destined for the origin service
         let config = format!(
             r#"[Interface]
-Address = {}/24
-PrivateKey = {}
+Address = {origin_ip}/24
+PrivateKey = {private_key}
+PostUp = iptables -A INPUT -i wg0 -s {proxy_ip} -j ACCEPT
+PostUp = iptables -A FORWARD -i wg0 -s {proxy_ip} -p tcp -j ACCEPT
+PostUp = iptables -A FORWARD -o wg0 -d {proxy_ip} -j ACCEPT
+PostUp = iptables -t nat -A PREROUTING -i wg0 -s {proxy_ip} -p tcp -j DNAT --to-destination {origin_host}:{origin_port}
+PostUp = iptables -t nat -A POSTROUTING -d {origin_host} -p tcp --dport {origin_port} -j MASQUERADE
+PreDown = iptables -D INPUT -i wg0 -s {proxy_ip} -j ACCEPT || true
+PreDown = iptables -D FORWARD -i wg0 -s {proxy_ip} -p tcp -j ACCEPT || true
+PreDown = iptables -D FORWARD -o wg0 -d {proxy_ip} -j ACCEPT || true
+PreDown = iptables -D PREROUTING -t nat -i wg0 -s {proxy_ip} -p tcp -j DNAT --to-destination {origin_host}:{origin_port} || true
+PreDown = iptables -D POSTROUTING -t nat -d {origin_host} -p tcp --dport {origin_port} -j MASQUERADE || true
 
 [Peer]
-PublicKey = {}
-PresharedKey = {}
-Endpoint = {}
-AllowedIPs = {}/32
+PublicKey = {peer_public_key}
+PresharedKey = {preshared_key}
+Endpoint = {proxy_endpoint}
+AllowedIPs = {proxy_ip}/32
 PersistentKeepalive = 25
 "#,
-            origin_ip,
-            origin_keys.private_key,
-            proxy_public_key,
-            origin_keys.preshared_key,
-            proxy_endpoint,
-            proxy_ip
+            origin_ip = origin_ip,
+            private_key = origin_keys.private_key,
+            proxy_ip = proxy_ip,
+            origin_host = origin_host,
+            origin_port = origin_port,
+            peer_public_key = proxy_public_key,
+            preshared_key = origin_keys.preshared_key,
+            proxy_endpoint = proxy_endpoint,
         );
 
         fs::write(&config_path, config).context("Failed to write WireGuard configuration")?;
+
+        // Set restrictive permissions on the config file (0600 - owner read/write only)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(&config_path, perms)
+                .context("Failed to set permissions on WireGuard configuration")?;
+        }
 
         debug!("WireGuard configuration written to {:?}", config_path);
 

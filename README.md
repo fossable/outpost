@@ -40,13 +40,6 @@ services:
 instance communicates with the origin service via an ephemeral WireGuard tunnel.
 
 The AWS deployment uses CloudFormation to create:
-- A new VPC with public subnet and internet gateway
-- An EC2 instance with WireGuard configured
-- Security groups that only allow WireGuard from the origin IP and configured ingress ports
-- Route53 DNS record pointing to the proxy
-- IAM role allowing the instance to self-destruct if the origin is unreachable for 5+ minutes
-
-**Note:** WireGuard key generation uses boringtun, so no WireGuard installation is required on the host.
 
 ```yml
 name: example_com
@@ -54,6 +47,8 @@ name: example_com
 services:
   outpost:
     image: fossable/outpost:latest
+    cap_add:
+      - NET_ADMIN
     depends_on:
       - www
     environment:

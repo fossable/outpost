@@ -5,6 +5,7 @@ use clap::Parser;
 use config::{CommandLine, ServiceConfig};
 use std::process::ExitCode;
 use tokio::net::TcpListener;
+use tracing::level_filters::LevelFilter;
 
 #[cfg(feature = "aws")]
 use tokio::signal;
@@ -25,7 +26,11 @@ pub mod aws;
 async fn main() -> Result<ExitCode> {
     let args = CommandLine::parse();
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
         .init();
 
     // Get config from command line or environment
@@ -66,6 +71,27 @@ async fn main() -> Result<ExitCode> {
         } => {
             // Validate CloudFront configuration
             service_config.validate_cloudfront()?;
+
+            // Check for NET_ADMIN capability (required for WireGuard and iptables)
+            info!("Checking for NET_ADMIN capability...");
+            match crate::wireguard::check_net_admin_capability().await {
+                Ok(true) => {
+                    info!("NET_ADMIN capability detected");
+                }
+                Ok(false) => {
+                    bail!(
+                        "NET_ADMIN capability is required but not available.\n\
+                        If running in Docker, add: --cap-add=NET_ADMIN\n\
+                        If running in docker-compose, add to your service:\n\
+                          cap_add:\n\
+                            - NET_ADMIN"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Could not verify NET_ADMIN capability: {}", e);
+                    tracing::warn!("Proceeding anyway, but WireGuard setup may fail");
+                }
+            }
 
             let ingress = service_config.ingress()?;
             let origin = service_config.origin()?;
@@ -138,7 +164,7 @@ async fn main() -> Result<ExitCode> {
                     ingress.host.clone(),
                     ingress.port,
                     ingress.protocol.clone(),
-                    origin.host,
+                    origin.host.clone(),
                     origin.port,
                     origin_ip,
                     regions,
@@ -177,6 +203,10 @@ async fn main() -> Result<ExitCode> {
 
             info!("Setting up WireGuard tunnel to proxy at {}", proxy_endpoint);
 
+            // Clone origin info before moving into tunnel setup
+            let origin_host = origin.host.clone();
+            let origin_port = origin.port;
+
             // Set up WireGuard tunnel on the origin side using boringtun
             let mut shutdown_rx4 = shutdown_rx.resubscribe();
             let tunnel = tokio::select! {
@@ -186,6 +216,8 @@ async fn main() -> Result<ExitCode> {
                     proxy_endpoint,
                     wg_proxy_ip,
                     wg_origin_ip,
+                    origin_host,
+                    origin_port,
                 ) => result?,
                 _ = shutdown_rx4.recv() => {
                     info!("Shutdown signal received during tunnel setup");

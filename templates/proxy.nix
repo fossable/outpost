@@ -31,11 +31,13 @@ in {
     # Set up NAT rules for port forwarding
     postSetup = ''
       ${pkgs.iptables}/bin/iptables -t nat -A PREROUTING -p {PROTOCOL} --dport {INGRESS_PORT} -j DNAT --to-destination {ORIGIN_IP}:{ORIGIN_PORT}
+      ${pkgs.iptables}/bin/iptables -t nat -A POSTROUTING -d {ORIGIN_IP}/32 -p {PROTOCOL} --dport {ORIGIN_PORT} -j MASQUERADE
       ${pkgs.iptables}/bin/iptables -t nat -A POSTROUTING -s {SUBNET}/24 -j MASQUERADE
     '';
 
     postShutdown = ''
       ${pkgs.iptables}/bin/iptables -t nat -D PREROUTING -p {PROTOCOL} --dport {INGRESS_PORT} -j DNAT --to-destination {ORIGIN_IP}:{ORIGIN_PORT} || true
+      ${pkgs.iptables}/bin/iptables -t nat -D POSTROUTING -d {ORIGIN_IP}/32 -p {PROTOCOL} --dport {ORIGIN_PORT} -j MASQUERADE || true
       ${pkgs.iptables}/bin/iptables -t nat -D POSTROUTING -s {SUBNET}/24 -j MASQUERADE || true
     '';
 
@@ -102,9 +104,9 @@ in {
   # Signal CloudFormation on first boot
   systemd.services.cloudformation-signal = {
     description = "Signal CloudFormation that initialization is complete";
-    # after = [ "network.target" "wireguard-wg0.service" ];
+    after = [ "network.target" "wireguard-wg0.service" ];
     requires = [ "wireguard-wg0.service" ];
-    # wantedBy = [ "multi-user.target" ];
+    wantedBy = [ "multi-user.target" ];
 
     serviceConfig = {
       Type = "oneshot";
