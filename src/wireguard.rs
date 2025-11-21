@@ -6,31 +6,6 @@ use tempfile::TempDir;
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
 
-/// Check if the process has NET_ADMIN capability (required for WireGuard and iptables)
-pub async fn check_net_admin_capability() -> Result<bool> {
-    // Try to check capabilities by reading /proc/self/status
-    if let Ok(status) = tokio::fs::read_to_string("/proc/self/status").await {
-        for line in status.lines() {
-            if line.starts_with("CapEff:") {
-                // Extract the effective capabilities hex value
-                if let Some(cap_hex) = line.split_whitespace().nth(1) {
-                    if let Ok(caps) = u64::from_str_radix(cap_hex, 16) {
-                        // NET_ADMIN is bit 12 (0x1000)
-                        const CAP_NET_ADMIN: u64 = 1 << 12;
-                        return Ok((caps & CAP_NET_ADMIN) != 0);
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: Try to execute a harmless iptables command to check if we have permission
-    match Command::new("iptables").arg("-L").arg("-n").output().await {
-        Ok(output) => Ok(output.status.success()),
-        Err(_) => Ok(false),
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct WireGuardKeys {
     pub private_key: String,
@@ -207,7 +182,9 @@ impl OriginTunnel {
         proxy_ip: String,
         origin_ip: String,
         origin_host: String,
-        origin_port: u16,
+        port_mappings: Vec<(u16, String)>, // (port, protocol)
+        upload_limit: Option<u32>,          // Upload limit in Mbps (origin -> proxy)
+        download_limit: Option<u32>,        // Download limit in Mbps (proxy -> origin)
     ) -> Result<Self> {
         info!("Setting up WireGuard tunnel on origin");
 
@@ -217,22 +194,153 @@ impl OriginTunnel {
         // Create WireGuard configuration with dynamically selected IPs
         // The iptables rules implement tight security:
         // 1. Only accept packets from the specific proxy IP on wg0
-        // 2. Only forward TCP traffic from proxy IP
+        // 2. Only forward traffic from proxy IP (per protocol)
         // 3. Only MASQUERADE traffic destined for the origin service
+
+        if port_mappings.is_empty() {
+            bail!("At least one port mapping is required for WireGuard tunnel");
+        }
+
+        // Build iptables rules for each port mapping
+        let mut post_up_rules = Vec::new();
+        let mut pre_down_rules = Vec::new();
+
+        // Allow WireGuard handshake and keepalive packets (UDP on the WireGuard interface itself)
+        post_up_rules.push(format!("iptables -A INPUT -i wg0 -s {} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT", proxy_ip));
+        pre_down_rules.push(format!("iptables -D INPUT -i wg0 -s {} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || true", proxy_ip));
+
+        // Common rules for general FORWARD (outbound to proxy)
+        post_up_rules.push(format!("iptables -A FORWARD -o wg0 -d {} -j ACCEPT", proxy_ip));
+        pre_down_rules.push(format!("iptables -D FORWARD -o wg0 -d {} -j ACCEPT || true", proxy_ip));
+
+        // Bandwidth limiting with tc (traffic control)
+        // Required kernel modules: sch_htb (for HTB qdisc)
+        // Upload limit: traffic going from origin to proxy (egress on wg0)
+        if let Some(limit) = upload_limit {
+            let rate_kbps = limit * 1000; // Convert Mbps to Kbps
+            info!("Setting upload bandwidth limit to {} Mbps ({} Kbps)", limit, rate_kbps);
+
+            // Create root qdisc with HTB (Hierarchical Token Bucket)
+            post_up_rules.push(format!("tc qdisc add dev wg0 root handle 1: htb default 10"));
+
+            // Create class with rate limit
+            post_up_rules.push(format!(
+                "tc class add dev wg0 parent 1: classid 1:10 htb rate {}kbit ceil {}kbit",
+                rate_kbps, rate_kbps
+            ));
+
+            // Cleanup
+            pre_down_rules.push(format!("tc qdisc del dev wg0 root || true"));
+        }
+
+        // Download limit: traffic coming from proxy to origin (ingress on wg0)
+        // Note: tc doesn't directly support ingress shaping, so we use ifb (intermediate functional block)
+        // Required kernel modules: ifb, act_mirred (for traffic redirection), sch_htb (for HTB qdisc)
+        if let Some(limit) = download_limit {
+            let rate_kbps = limit * 1000; // Convert Mbps to Kbps
+            info!("Setting download bandwidth limit to {} Mbps ({} Kbps)", limit, rate_kbps);
+
+            // Load ifb module and create ifb0 device
+            post_up_rules.push(format!("modprobe ifb numifbs=1"));
+            post_up_rules.push(format!("ip link set dev ifb0 up"));
+
+            // Redirect ingress traffic from wg0 to ifb0
+            post_up_rules.push(format!("tc qdisc add dev wg0 handle ffff: ingress"));
+            post_up_rules.push(format!(
+                "tc filter add dev wg0 parent ffff: protocol all u32 match u32 0 0 action mirred egress redirect dev ifb0"
+            ));
+
+            // Apply rate limit on ifb0 (which represents wg0's ingress)
+            post_up_rules.push(format!("tc qdisc add dev ifb0 root handle 1: htb default 10"));
+            post_up_rules.push(format!(
+                "tc class add dev ifb0 parent 1: classid 1:10 htb rate {}kbit ceil {}kbit",
+                rate_kbps, rate_kbps
+            ));
+
+            // Cleanup
+            pre_down_rules.push(format!("tc qdisc del dev wg0 ingress || true"));
+            pre_down_rules.push(format!("tc qdisc del dev ifb0 root || true"));
+            pre_down_rules.push(format!("ip link set dev ifb0 down || true"));
+        }
+
+        // Create custom chain for traffic accounting (excludes WireGuard overhead)
+        post_up_rules.push(format!("iptables -N OUTPOST_ACCOUNTING || true"));
+        pre_down_rules.push(format!("iptables -F OUTPOST_ACCOUNTING || true"));
+        pre_down_rules.push(format!("iptables -X OUTPOST_ACCOUNTING || true"));
+
+        // Per-port rules
+        for (port, protocol) in &port_mappings {
+            let proto_lower = protocol.to_lowercase();
+
+            // Validate protocol
+            if proto_lower != "tcp" && proto_lower != "udp" {
+                bail!("Unsupported protocol '{}' for port {}. Only 'tcp' and 'udp' are supported.", protocol, port);
+            }
+
+            // INPUT rules for specific protocol/port (only accept traffic on ports we're proxying)
+            post_up_rules.push(format!(
+                "iptables -A INPUT -i wg0 -s {} -p {} --dport {} -j ACCEPT",
+                proxy_ip, proto_lower, port
+            ));
+            pre_down_rules.push(format!(
+                "iptables -D INPUT -i wg0 -s {} -p {} --dport {} -j ACCEPT || true",
+                proxy_ip, proto_lower, port
+            ));
+
+            // FORWARD rules for specific protocol/port
+            post_up_rules.push(format!(
+                "iptables -A FORWARD -i wg0 -s {} -p {} -j ACCEPT",
+                proxy_ip, proto_lower
+            ));
+            pre_down_rules.push(format!(
+                "iptables -D FORWARD -i wg0 -s {} -p {} -j ACCEPT || true",
+                proxy_ip, proto_lower
+            ));
+
+            // DNAT rule to forward traffic to origin
+            post_up_rules.push(format!(
+                "iptables -t nat -A PREROUTING -i wg0 -s {} -p {} --dport {} -j DNAT --to-destination {}:{}",
+                proxy_ip, proto_lower, port, origin_host, port
+            ));
+            pre_down_rules.push(format!(
+                "iptables -t nat -D PREROUTING -i wg0 -s {} -p {} --dport {} -j DNAT --to-destination {}:{} || true",
+                proxy_ip, proto_lower, port, origin_host, port
+            ));
+
+            // MASQUERADE rule for return traffic
+            post_up_rules.push(format!(
+                "iptables -t nat -A POSTROUTING -d {} -p {} --dport {} -j MASQUERADE",
+                origin_host, proto_lower, port
+            ));
+            pre_down_rules.push(format!(
+                "iptables -t nat -D POSTROUTING -d {} -p {} --dport {} -j MASQUERADE || true",
+                origin_host, proto_lower, port
+            ));
+
+            // Accounting rules to track actual application traffic (not WireGuard overhead)
+            // Track traffic going TO origin (download from user perspective)
+            post_up_rules.push(format!(
+                "iptables -A OUTPOST_ACCOUNTING -d {} -p {} --dport {} -j RETURN",
+                origin_host, proto_lower, port
+            ));
+
+            // Track traffic coming FROM origin (upload from user perspective)
+            post_up_rules.push(format!(
+                "iptables -A OUTPOST_ACCOUNTING -s {} -p {} --sport {} -j RETURN",
+                origin_host, proto_lower, port
+            ));
+        }
+
+        // Jump to accounting chain from FORWARD to count packets/bytes
+        post_up_rules.push(format!("iptables -A FORWARD -j OUTPOST_ACCOUNTING"));
+        pre_down_rules.push(format!("iptables -D FORWARD -j OUTPOST_ACCOUNTING || true"));
+
         let config = format!(
             r#"[Interface]
 Address = {origin_ip}/24
 PrivateKey = {private_key}
-PostUp = iptables -A INPUT -i wg0 -s {proxy_ip} -j ACCEPT
-PostUp = iptables -A FORWARD -i wg0 -s {proxy_ip} -p tcp -j ACCEPT
-PostUp = iptables -A FORWARD -o wg0 -d {proxy_ip} -j ACCEPT
-PostUp = iptables -t nat -A PREROUTING -i wg0 -s {proxy_ip} -p tcp -j DNAT --to-destination {origin_host}:{origin_port}
-PostUp = iptables -t nat -A POSTROUTING -d {origin_host} -p tcp --dport {origin_port} -j MASQUERADE
-PreDown = iptables -D INPUT -i wg0 -s {proxy_ip} -j ACCEPT || true
-PreDown = iptables -D FORWARD -i wg0 -s {proxy_ip} -p tcp -j ACCEPT || true
-PreDown = iptables -D FORWARD -o wg0 -d {proxy_ip} -j ACCEPT || true
-PreDown = iptables -D PREROUTING -t nat -i wg0 -s {proxy_ip} -p tcp -j DNAT --to-destination {origin_host}:{origin_port} || true
-PreDown = iptables -D POSTROUTING -t nat -d {origin_host} -p tcp --dport {origin_port} -j MASQUERADE || true
+{post_up}
+{pre_down}
 
 [Peer]
 PublicKey = {peer_public_key}
@@ -243,12 +351,12 @@ PersistentKeepalive = 25
 "#,
             origin_ip = origin_ip,
             private_key = origin_keys.private_key,
-            proxy_ip = proxy_ip,
-            origin_host = origin_host,
-            origin_port = origin_port,
+            post_up = post_up_rules.iter().map(|r| format!("PostUp = {}", r)).collect::<Vec<_>>().join("\n"),
+            pre_down = pre_down_rules.iter().map(|r| format!("PreDown = {}", r)).collect::<Vec<_>>().join("\n"),
             peer_public_key = proxy_public_key,
             preshared_key = origin_keys.preshared_key,
             proxy_endpoint = proxy_endpoint,
+            proxy_ip = proxy_ip,
         );
 
         fs::write(&config_path, config).context("Failed to write WireGuard configuration")?;
@@ -312,6 +420,51 @@ PersistentKeepalive = 25
             proxy_ip,
             origin_ip,
         })
+    }
+
+    /// Get traffic statistics from iptables counters
+    /// Returns (bytes_uploaded, bytes_downloaded)
+    pub async fn get_traffic_stats(&self) -> Result<(u64, u64)> {
+        let output = Command::new("iptables")
+            .args(["-L", "OUTPOST_ACCOUNTING", "-v", "-n", "-x"])
+            .output()
+            .await
+            .context("Failed to run iptables to get traffic stats")?;
+
+        if !output.status.success() {
+            bail!("iptables command failed");
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut bytes_to_origin = 0u64;
+        let mut bytes_from_origin = 0u64;
+
+        // Parse iptables output
+        // Format: pkts bytes target prot opt in out source destination
+        for line in stdout.lines().skip(2) {
+            // Skip header lines
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 9 {
+                continue;
+            }
+
+            // Extract byte count (second column)
+            if let Ok(bytes) = parts[1].parse::<u64>() {
+                // Check if this is traffic TO origin (destination match)
+                if parts.len() >= 9 && parts[8].starts_with("0.0.0.0/0") && parts[7] != "0.0.0.0/0" {
+                    bytes_to_origin += bytes;
+                }
+                // Check if this is traffic FROM origin (source match)
+                else if parts.len() >= 9 && parts[7].starts_with("0.0.0.0/0") && parts[8] != "0.0.0.0/0" {
+                    bytes_from_origin += bytes;
+                }
+            }
+        }
+
+        // From user's perspective:
+        // - Upload = traffic going TO origin (download from proxy)
+        // - Download = traffic FROM origin (upload to proxy)
+        Ok((bytes_to_origin, bytes_from_origin))
     }
 }
 

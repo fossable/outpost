@@ -5,8 +5,9 @@ pub struct CloudFormationTemplate {
     pub stack_name: String,
     pub region: String,
     pub ingress_host: String,
-    pub ingress_port: u16,
+    pub ingress_port: u16, // Primary port (first ingress) for backwards compat
     pub ingress_protocol: String,
+    pub port_mappings: Vec<(u16, String)>, // All port mappings (port, protocol)
     pub origin_host: String,
     pub origin_port: u16,
     pub origin_ip: String,
@@ -334,14 +335,18 @@ impl CloudFormationTemplate {
                 "CidrIp": format!("{}/32", self.origin_ip),
                 "Description": "WireGuard from origin"
             }),
-            json!({
-                "IpProtocol": self.ingress_protocol.as_str(),
-                "FromPort": self.ingress_port,
-                "ToPort": self.ingress_port,
-                "CidrIp": "0.0.0.0/0",
-                "Description": "Ingress traffic"
-            }),
         ];
+
+        // Add rules for each port mapping
+        for (port, protocol) in &self.port_mappings {
+            rules.push(json!({
+                "IpProtocol": protocol.to_lowercase(),
+                "FromPort": port,
+                "ToPort": port,
+                "CidrIp": "0.0.0.0/0",
+                "Description": format!("Ingress {} traffic on port {}", protocol.to_uppercase(), port)
+            }));
+        }
 
         if self.debug {
             rules.push(json!({
@@ -386,6 +391,24 @@ impl CloudFormationTemplate {
             .map(|s| format!("{}.0", s))
             .unwrap_or_else(|| "172.17.0.0".to_string());
 
+        // Generate Nix list expression for port mappings
+        // Format: [ { port = 80; protocol = "tcp"; } { port = 443; protocol = "tcp"; } ]
+        let port_mappings_nix = if self.port_mappings.is_empty() {
+            "[ ]".to_string()
+        } else {
+            let mappings: Vec<String> = self.port_mappings
+                .iter()
+                .map(|(port, protocol)| {
+                    format!(
+                        "{{ port = {}; protocol = \"{}\"; }}",
+                        port,
+                        protocol.to_lowercase()
+                    )
+                })
+                .collect();
+            format!("[\n    {}\n  ]", mappings.join("\n    "))
+        };
+
         // Replace placeholders in the Nix template
         let nix_config = NIX_TEMPLATE
             .replace(
@@ -393,9 +416,7 @@ impl CloudFormationTemplate {
                 &format!("debug = {}", if self.debug { "true" } else { "false" }),
             )
             .replace("{PROXY_WG_PRIVATE_KEY}", &self.proxy_wg_private_key)
-            .replace("{PROTOCOL}", &self.ingress_protocol)
-            .replace("{INGRESS_PORT}", &self.ingress_port.to_string())
-            .replace("{ORIGIN_PORT}", &self.origin_port.to_string())
+            .replace("{PORT_MAPPINGS}", &port_mappings_nix)
             .replace("{ORIGIN_WG_PUBLIC_KEY}", &self.origin_wg_public_key)
             .replace("{PRESHARED_KEY}", &self.preshared_key)
             .replace("{ORIGIN_IP}", &self.wg_origin_ip)
@@ -420,6 +441,7 @@ mod tests {
             ingress_host: "test.example.com".to_string(),
             ingress_port: 80,
             ingress_protocol: "tcp".to_string(),
+            port_mappings: vec![(80, "tcp".to_string())],
             origin_host: "localhost".to_string(),
             origin_port: 8080,
             origin_ip: "1.2.3.4".to_string(),
@@ -445,6 +467,7 @@ mod tests {
             ingress_host: "test.example.com".to_string(),
             ingress_port: 80,
             ingress_protocol: "tcp".to_string(),
+            port_mappings: vec![(80, "tcp".to_string())],
             origin_host: "localhost".to_string(),
             origin_port: 8080,
             origin_ip: "1.2.3.4".to_string(),
@@ -470,6 +493,7 @@ mod tests {
             ingress_host: "test.example.com".to_string(),
             ingress_port: 80,
             ingress_protocol: "tcp".to_string(),
+            port_mappings: vec![(80, "tcp".to_string())],
             origin_host: "localhost".to_string(),
             origin_port: 8080,
             origin_ip: "1.2.3.4".to_string(),
@@ -486,10 +510,11 @@ mod tests {
 
         let userdata = template.generate_userdata();
         let userdata_str = serde_json::to_string(&userdata).unwrap();
-        // Check for NixOS configuration syntax and TCP protocol
+        // Check for NixOS configuration syntax and port mappings
         assert!(userdata_str.contains("{ config, pkgs, lib, ... }:"));
         assert!(userdata_str.contains("debug = false"));
-        assert!(userdata_str.contains("-p tcp --dport 80"));
+        assert!(userdata_str.contains("port = 80"));
+        assert!(userdata_str.contains("protocol = \\\"tcp\\\""));
     }
 
     #[test]
@@ -500,6 +525,7 @@ mod tests {
             ingress_host: "test.example.com".to_string(),
             ingress_port: 53,
             ingress_protocol: "udp".to_string(),
+            port_mappings: vec![(53, "udp".to_string())],
             origin_host: "localhost".to_string(),
             origin_port: 53,
             origin_ip: "1.2.3.4".to_string(),
@@ -516,10 +542,11 @@ mod tests {
 
         let userdata = template.generate_userdata();
         let userdata_str = serde_json::to_string(&userdata).unwrap();
-        // Check for NixOS configuration syntax and UDP protocol
+        // Check for NixOS configuration syntax and port mappings
         assert!(userdata_str.contains("{ config, pkgs, lib, ... }:"));
         assert!(userdata_str.contains("debug = false"));
-        assert!(userdata_str.contains("-p udp --dport 53"));
+        assert!(userdata_str.contains("port = 53"));
+        assert!(userdata_str.contains("protocol = \\\"udp\\\""));
     }
 
     #[test]
@@ -530,6 +557,7 @@ mod tests {
             ingress_host: "test.example.com".to_string(),
             ingress_port: 80,
             ingress_protocol: "tcp".to_string(),
+            port_mappings: vec![(80, "tcp".to_string())],
             origin_host: "localhost".to_string(),
             origin_port: 8080,
             origin_ip: "1.2.3.4".to_string(),

@@ -1,6 +1,24 @@
 { config, pkgs, lib, ... }:
 
-let debug = false;
+let
+  debug = false; # Passing --debug will cause this to be enabled
+
+  # Port mappings: list of { port, protocol }
+  portMappings = {PORT_MAPPINGS};
+
+  # Generate iptables rules for each port mapping
+  generatePortForwardRules = mappings:
+    lib.concatMapStrings (m: ''
+      ${pkgs.iptables}/bin/iptables -t nat -A PREROUTING -p ${m.protocol} --dport ${toString m.port} -j DNAT --to-destination {ORIGIN_IP}:${toString m.port}
+      ${pkgs.iptables}/bin/iptables -t nat -A POSTROUTING -d {ORIGIN_IP}/32 -p ${m.protocol} --dport ${toString m.port} -j MASQUERADE
+    '') mappings;
+
+  generatePortForwardCleanup = mappings:
+    lib.concatMapStrings (m: ''
+      ${pkgs.iptables}/bin/iptables -t nat -D PREROUTING -p ${m.protocol} --dport ${toString m.port} -j DNAT --to-destination {ORIGIN_IP}:${toString m.port} || true
+      ${pkgs.iptables}/bin/iptables -t nat -D POSTROUTING -d {ORIGIN_IP}/32 -p ${m.protocol} --dport ${toString m.port} -j MASQUERADE || true
+    '') mappings;
+
 in {
   imports = [ <nixpkgs/nixos/modules/virtualisation/amazon-image.nix> ];
   ec2.hvm = true;
@@ -28,16 +46,14 @@ in {
     listenPort = 51820;
     privateKey = "{PROXY_WG_PRIVATE_KEY}";
 
-    # Set up NAT rules for port forwarding
+    # Set up NAT rules for port forwarding (dynamically generated from portMappings)
     postSetup = ''
-      ${pkgs.iptables}/bin/iptables -t nat -A PREROUTING -p {PROTOCOL} --dport {INGRESS_PORT} -j DNAT --to-destination {ORIGIN_IP}:{ORIGIN_PORT}
-      ${pkgs.iptables}/bin/iptables -t nat -A POSTROUTING -d {ORIGIN_IP}/32 -p {PROTOCOL} --dport {ORIGIN_PORT} -j MASQUERADE
+      ${generatePortForwardRules portMappings}
       ${pkgs.iptables}/bin/iptables -t nat -A POSTROUTING -s {SUBNET}/24 -j MASQUERADE
     '';
 
     postShutdown = ''
-      ${pkgs.iptables}/bin/iptables -t nat -D PREROUTING -p {PROTOCOL} --dport {INGRESS_PORT} -j DNAT --to-destination {ORIGIN_IP}:{ORIGIN_PORT} || true
-      ${pkgs.iptables}/bin/iptables -t nat -D POSTROUTING -d {ORIGIN_IP}/32 -p {PROTOCOL} --dport {ORIGIN_PORT} -j MASQUERADE || true
+      ${generatePortForwardCleanup portMappings}
       ${pkgs.iptables}/bin/iptables -t nat -D POSTROUTING -s {SUBNET}/24 -j MASQUERADE || true
     '';
 
@@ -50,12 +66,19 @@ in {
   };
 
   services = {
+    # Only enable SSH in debug mode
     openssh = {
       enable = lib.mkForce debug;
       settings.PasswordAuthentication = lib.mkForce true;
       settings.PermitRootLogin = lib.mkForce "yes";
     };
     amazon-ssm-agent.enable = pkgs.lib.mkForce false;
+
+    # Reduce journal size
+    journald.extraConfig = ''
+      SystemMaxUse=100M
+      MaxRetentionSec=1day
+    '';
   };
 
   users = {
@@ -79,7 +102,7 @@ in {
 
     script = ''
       FAIL_COUNT=0
-      MAX_FAILS=60  # 5 minutes with 5-second checks
+      MAX_FAILS=5  # 5 minutes with 60-second checks
 
       while true; do
         # Try to ping the origin through the WireGuard tunnel
@@ -90,18 +113,19 @@ in {
           echo "$(date): Origin unreachable. Fail count: $FAIL_COUNT/$MAX_FAILS"
 
           if [ $FAIL_COUNT -ge $MAX_FAILS ]; then
-            echo "$(date): Origin unreachable for 5 minutes. Self-destructing..."
+            echo "$(date): Maximum failures reached. Triggering self-destruct..."
             ${pkgs.awscli2}/bin/aws cloudformation delete-stack --stack-name "{STACK_NAME}" --region "{REGION}"
+            echo "$(date): Self-destruct initiated. Exiting monitor service."
             exit 0
           fi
         fi
 
-        sleep 5
+        sleep 60
       done
     '';
   };
 
-  # Signal CloudFormation on first boot
+  # Signal CloudFormation once we're ready to accept connections
   systemd.services.cloudformation-signal = {
     description = "Signal CloudFormation that initialization is complete";
     after = [ "network.target" "wireguard-wg0.service" ];
@@ -114,6 +138,8 @@ in {
     };
 
     script = ''
+      set -e
+
       # Query CloudFormation to get the WaitHandle URL
       WAIT_HANDLE_URL=$(${pkgs.awscli2}/bin/aws cloudformation describe-stack-resource \
         --stack-name "{STACK_NAME}" \
@@ -140,11 +166,11 @@ in {
   documentation.doc.enable = false;
   documentation.nixos.enable = false;
 
-  # Reduce journal size
-  services.journald.extraConfig = ''
-    SystemMaxUse=100M
-    MaxRetentionSec=1day
-  '';
+  # Try to fit on a smaller instance
+  zramSwap.enable = true;
+
+  # Attempt to limit peak memory usage during builds
+  nix.settings.cores = 1;
 
   system.stateVersion = "25.05";
 }

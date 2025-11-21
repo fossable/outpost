@@ -14,11 +14,27 @@ use tokio::sync::RwLock;
 #[folder = "assets/"]
 struct Assets;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AppState {
     pub stats: Arc<RwLock<TunnelStats>>,
     pub proxy_info: Arc<RwLock<Option<ProxyInfo>>>,
     pub cloudfront_info: Arc<RwLock<Option<CloudFrontInfo>>>,
+    pub tunnel: Arc<RwLock<Option<Arc<crate::wireguard::OriginTunnel>>>>,
+    pub upload_limit: Option<u32>,
+    pub download_limit: Option<u32>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            stats: Arc::new(RwLock::new(TunnelStats::default())),
+            proxy_info: Arc::new(RwLock::new(None)),
+            cloudfront_info: Arc::new(RwLock::new(None)),
+            tunnel: Arc::new(RwLock::new(None)),
+            upload_limit: None,
+            download_limit: None,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -166,6 +182,8 @@ pub struct IndexTemplate {
     pub tunnel_stats: TunnelStats,
     pub proxy_info: Option<ProxyInfo>,
     pub cloudfront_info: Option<CloudFrontInfo>,
+    pub upload_limit: Option<u32>,
+    pub download_limit: Option<u32>,
 }
 
 pub async fn assets(axum::extract::Path(file): axum::extract::Path<String>) -> Response {
@@ -188,12 +206,58 @@ pub async fn assets(axum::extract::Path(file): axum::extract::Path<String>) -> R
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/api/stats", get(stats_api))
         .route("/assets/*file", get(assets))
         .with_state(state)
 }
 
+pub async fn stats_api(State(state): State<AppState>) -> impl IntoResponse {
+    use axum::Json;
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct StatsResponse {
+        bytes_sent: u64,
+        bytes_received: u64,
+        bytes_sent_formatted: String,
+        bytes_received_formatted: String,
+        packets_sent: u64,
+        packets_received: u64,
+    }
+
+    let mut stats = state.stats.read().await.clone();
+
+    // Update stats from iptables if tunnel is available
+    if let Some(tunnel) = state.tunnel.read().await.as_ref() {
+        if let Ok((bytes_sent, bytes_received)) = tunnel.get_traffic_stats().await {
+            stats.bytes_sent = bytes_sent;
+            stats.bytes_received = bytes_received;
+        }
+    }
+
+    stats.format_sizes();
+
+    Json(StatsResponse {
+        bytes_sent: stats.bytes_sent,
+        bytes_received: stats.bytes_received,
+        bytes_sent_formatted: stats.bytes_sent_formatted,
+        bytes_received_formatted: stats.bytes_received_formatted,
+        packets_sent: stats.packets_sent,
+        packets_received: stats.packets_received,
+    })
+}
+
 pub async fn index(State(state): State<AppState>) -> impl IntoResponse {
     let mut stats = state.stats.read().await.clone();
+
+    // Update stats from iptables if tunnel is available
+    if let Some(tunnel) = state.tunnel.read().await.as_ref() {
+        if let Ok((bytes_sent, bytes_received)) = tunnel.get_traffic_stats().await {
+            stats.bytes_sent = bytes_sent;
+            stats.bytes_received = bytes_received;
+        }
+    }
+
     stats.format_sizes();
     let mut proxy_info = state.proxy_info.read().await.clone();
     let cloudfront_info = state.cloudfront_info.read().await.clone();
@@ -212,6 +276,8 @@ pub async fn index(State(state): State<AppState>) -> impl IntoResponse {
         tunnel_stats: stats,
         proxy_info,
         cloudfront_info,
+        upload_limit: state.upload_limit,
+        download_limit: state.download_limit,
     };
 
     Html(template.render().unwrap())

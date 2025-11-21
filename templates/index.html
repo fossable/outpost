@@ -206,7 +206,7 @@
             <p class="header-subtitle">
                 <span class="status-indicator {% if tunnel_stats.tunnel_up %}status-up{% else %}status-down{% endif %}"></span>
                 Tunnel {% if tunnel_stats.tunnel_up %}Active{% else %}Inactive{% endif %}
-                {% if tunnel_stats.tunnel_up %} &middot; Uptime: {{ tunnel_stats.uptime_seconds }}s{% endif %}
+                {% if tunnel_stats.tunnel_up %} &middot; Uptime: <span id="uptime">{{ tunnel_stats.uptime_seconds }}s</span>{% endif %}
             </p>
         </div>
 
@@ -214,23 +214,31 @@
             <div class="stat-block">
                 <div class="stat-header">
                     <img src="/assets/wireguard.svg" alt="Sent" class="stat-icon">
-                    <span class="stat-label">Data Sent</span>
+                    <span class="stat-label">Upload</span>
                 </div>
                 <div>
-                    <span class="stat-value">{{ tunnel_stats.bytes_sent_formatted }}</span>
+                    <span class="stat-value" id="bytes-sent">{{ tunnel_stats.bytes_sent_formatted }}</span>
                 </div>
-                <div class="stat-detail">{{ tunnel_stats.packets_sent }} packets</div>
+                <div class="stat-detail" id="packets-sent">{{ tunnel_stats.packets_sent }} packets</div>
+                <div class="stat-detail" id="upload-speed" style="margin-top: 8px; color: #2ecc71;">0 B/s</div>
+                {% if let Some(limit) = upload_limit %}
+                    <div class="stat-detail" style="margin-top: 8px; color: #ffa500;">Limit: {{ limit }} Mbps</div>
+                {% endif %}
             </div>
 
             <div class="stat-block">
                 <div class="stat-header">
                     <img src="/assets/wireguard.svg" alt="Received" class="stat-icon">
-                    <span class="stat-label">Data Received</span>
+                    <span class="stat-label">Download</span>
                 </div>
                 <div>
-                    <span class="stat-value">{{ tunnel_stats.bytes_received_formatted }}</span>
+                    <span class="stat-value" id="bytes-received">{{ tunnel_stats.bytes_received_formatted }}</span>
                 </div>
-                <div class="stat-detail">{{ tunnel_stats.packets_received }} packets</div>
+                <div class="stat-detail" id="packets-received">{{ tunnel_stats.packets_received }} packets</div>
+                <div class="stat-detail" id="download-speed" style="margin-top: 8px; color: #2ecc71;">0 B/s</div>
+                {% if let Some(limit) = download_limit %}
+                    <div class="stat-detail" style="margin-top: 8px; color: #ffa500;">Limit: {{ limit }} Mbps</div>
+                {% endif %}
             </div>
         </div>
 
@@ -267,10 +275,6 @@
                             <div class="proxy-item">
                                 <div class="proxy-item-label">Launch Time</div>
                                 <div class="proxy-item-value">{{ launch_time }}</div>
-                            </div>
-                            <div class="proxy-item">
-                                <div class="proxy-item-label">Uptime</div>
-                                <div class="proxy-item-value">{{ uptime }}</div>
                             </div>
                         </div>
                     </div>
@@ -322,5 +326,106 @@
             </div>
         {% endif %}
     </div>
+
+    <script>
+        // Track uptime starting from initial value
+        let uptimeSeconds = {{ tunnel_stats.uptime_seconds }};
+        const tunnelUp = {% if tunnel_stats.tunnel_up %}true{% else %}false{% endif %};
+
+        function formatUptime(seconds) {
+            if (seconds < 60) {
+                return seconds + 's';
+            } else if (seconds < 3600) {
+                const mins = Math.floor(seconds / 60);
+                const secs = seconds % 60;
+                return mins + 'm ' + secs + 's';
+            } else if (seconds < 86400) {
+                const hours = Math.floor(seconds / 3600);
+                const mins = Math.floor((seconds % 3600) / 60);
+                return hours + 'h ' + mins + 'm';
+            } else {
+                const days = Math.floor(seconds / 86400);
+                const hours = Math.floor((seconds % 86400) / 3600);
+                const mins = Math.floor((seconds % 3600) / 60);
+                return days + 'd ' + hours + 'h ' + mins + 'm';
+            }
+        }
+
+        function updateUptime() {
+            if (tunnelUp) {
+                const uptimeElement = document.getElementById('uptime');
+                if (uptimeElement) {
+                    uptimeElement.textContent = formatUptime(uptimeSeconds);
+                    uptimeSeconds++;
+                }
+            }
+        }
+
+        // Update uptime every second if tunnel is up
+        if (tunnelUp) {
+            setInterval(updateUptime, 1000);
+            updateUptime(); // Initial update to format properly
+        }
+
+        // Track previous values for speed calculation
+        let prevBytesSent = {{ tunnel_stats.bytes_sent }};
+        let prevBytesReceived = {{ tunnel_stats.bytes_received }};
+        let lastUpdateTime = Date.now();
+
+        function formatSpeed(bytesPerSecond) {
+            const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
+            let speed = bytesPerSecond;
+            let unitIndex = 0;
+
+            while (speed >= 1024 && unitIndex < units.length - 1) {
+                speed /= 1024;
+                unitIndex++;
+            }
+
+            if (unitIndex === 0) {
+                return speed.toFixed(0) + ' ' + units[unitIndex];
+            } else {
+                return speed.toFixed(2) + ' ' + units[unitIndex];
+            }
+        }
+
+        // Fetch and update stats from API every 2 seconds
+        async function updateStats() {
+            try {
+                const response = await fetch('/api/stats');
+                if (!response.ok) return;
+
+                const data = await response.json();
+                const now = Date.now();
+                const timeDelta = (now - lastUpdateTime) / 1000; // Convert to seconds
+
+                // Calculate speed (bytes per second)
+                const uploadSpeed = (data.bytes_sent - prevBytesSent) / timeDelta;
+                const downloadSpeed = (data.bytes_received - prevBytesReceived) / timeDelta;
+
+                // Update bytes sent/received
+                document.getElementById('bytes-sent').textContent = data.bytes_sent_formatted;
+                document.getElementById('bytes-received').textContent = data.bytes_received_formatted;
+
+                // Update packet counts
+                document.getElementById('packets-sent').textContent = data.packets_sent + ' packets';
+                document.getElementById('packets-received').textContent = data.packets_received + ' packets';
+
+                // Update speeds
+                document.getElementById('upload-speed').textContent = '↑ ' + formatSpeed(uploadSpeed);
+                document.getElementById('download-speed').textContent = '↓ ' + formatSpeed(downloadSpeed);
+
+                // Update previous values
+                prevBytesSent = data.bytes_sent;
+                prevBytesReceived = data.bytes_received;
+                lastUpdateTime = now;
+            } catch (error) {
+                console.error('Failed to fetch stats:', error);
+            }
+        }
+
+        // Update stats every 2 seconds
+        setInterval(updateStats, 2000);
+    </script>
 </body>
 </html>

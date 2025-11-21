@@ -1,5 +1,6 @@
 #![recursion_limit = "512"]
 
+#[cfg(feature = "dashboard")]
 pub mod api;
 pub mod config;
 pub mod wireguard;

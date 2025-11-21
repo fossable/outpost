@@ -157,6 +157,7 @@ impl AwsProxy {
         use_cloudfront: bool,
         wg_proxy_ip: String,
         wg_origin_ip: String,
+        port_mappings: Vec<(u16, String)>,
     ) -> Result<Self> {
         // Use the first region in the list, or fall back to defaults
         let region = regions
@@ -188,6 +189,7 @@ impl AwsProxy {
             ingress_host: ingress_host.clone(),
             ingress_port,
             ingress_protocol,
+            port_mappings,
             origin_host,
             origin_port,
             origin_ip,

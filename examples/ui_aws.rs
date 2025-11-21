@@ -30,6 +30,8 @@ async fn index() -> Html<String> {
         tunnel_stats: stats,
         proxy_info,
         cloudfront_info: None,
+        upload_limit: Some(100),
+        download_limit: Some(100),
     };
 
     Html(template.render().unwrap())

@@ -24,6 +24,9 @@ async fn index() -> Html<String> {
     let template = IndexTemplate {
         tunnel_stats: stats,
         proxy_info,
+        cloudfront_info: None,
+        upload_limit: None,
+        download_limit: None,
     };
 
     Html(template.render().unwrap())
