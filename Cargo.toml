@@ -6,7 +6,7 @@ license = "Unlicense"
 name = "outpost"
 repository = "https://github.com/fossable/outpost"
 rust-version = "1.82"
-version = "0.0.8"
+version = "0.0.9"
 
 [dependencies]
 anyhow = "1.0.86"
