@@ -10,11 +10,12 @@
 <hr>
 
 **outpost** allows you to expose self-hosted web services to the Internet via
-popular cloud providers.
+popular cloud providers. Therefore it's possible to take advantage of some
+features of the cloud without getting locked in to any particular vendor.
 
 ### Cloudflare
 
-HTTP sites can be hosted with Cloudflare easily:
+HTTP sites can be hosted with Cloudflare:
 
 ```yml
 name: example_com
@@ -23,16 +24,18 @@ services:
   outpost:
     image: fossable/outpost:latest
     depends_on:
-      - www
+      - origin_www
     environment:
       OUTPOST_CLOUDFLARE_INGRESS: tls://www.example.com:443
-      OUTPOST_CLOUDFLARE_ORIGIN: tcp://www:80
+      OUTPOST_CLOUDFLARE_ORIGIN: tcp://origin_www:80
       OUTPOST_CLOUDFLARE_ORIGIN_CERT: |
         -----BEGIN PRIVATE KEY-----
 
-  www:
+  origin_www:
     image: httpd:latest
 ```
+
+This takes advantage of Cloudflare for TLS cert generation and their CDN.
 
 ### AWS
 
@@ -50,15 +53,15 @@ services:
     cap_add:
       - NET_ADMIN
     depends_on:
-      - www
+      - origin_www
     environment:
       OUTPOST_AWS_INGRESS: tcp://www.example.com:80
-      OUTPOST_AWS_ORIGIN: tcp://www:8080
-      OUTPOST_AWS_REGIONS: us-east-2
+      OUTPOST_AWS_ORIGIN: tcp://origin_www:8080
+      OUTPOST_AWS_REGIONS: us-east-2 # TODO only one
       OUTPOST_AWS_HOSTED_ZONE_ID: Z1234567890ABC
       AWS_ACCESS_KEY_ID: <...>
       AWS_SECRET_ACCESS_KEY: <...>
 
-  www:
+  origin_www:
     image: httpd:latest
 ```

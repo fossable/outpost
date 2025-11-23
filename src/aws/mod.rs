@@ -353,7 +353,7 @@ impl AwsProxy {
                                     .iter()
                                     .filter(|e| {
                                         e.logical_resource_id()
-                                            .map_or(false, |id| id != self.stack_name)
+                                            .is_some_and(|id| id != self.stack_name)
                                     })
                                     .filter_map(|e| e.logical_resource_id())
                                     .collect::<std::collections::HashSet<_>>()
@@ -552,7 +552,7 @@ impl AwsProxy {
                                             .iter()
                                             .filter(|e| {
                                                 e.logical_resource_id()
-                                                    .map_or(false, |id| id != self.stack_name)
+                                                    .is_some_and(|id| id != self.stack_name)
                                             })
                                             .filter_map(|e| e.logical_resource_id())
                                             .collect::<std::collections::HashSet<_>>()

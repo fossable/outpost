@@ -30,7 +30,9 @@ pub struct CloudflareProxy {
 impl Drop for CloudflareProxy {
     fn drop(&mut self) {
         debug!("Stopping cloudflare tunnel");
-        futures::executor::block_on(self.process.kill()).unwrap();
+        // Note: We can't use async in Drop, so we use blocking. This is not ideal but necessary.
+        // Ignore errors during cleanup - process may have already exited.
+        let _ = futures::executor::block_on(self.process.kill());
     }
 }
 

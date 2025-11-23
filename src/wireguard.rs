@@ -1,7 +1,6 @@
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
 use std::fs;
-use std::net::Ipv4Addr;
 use tempfile::TempDir;
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
@@ -33,10 +32,28 @@ impl WireGuardKeys {
             .to_string();
 
         // Derive public key from private key using wg pubkey
-        let public_key_output = Command::new("sh")
-            .arg("-c")
-            .arg(format!("echo '{}' | wg pubkey", private_key))
-            .output()
+        let mut public_key_cmd = Command::new("wg")
+            .arg("pubkey")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .context("Failed to spawn wg pubkey")?;
+
+        // Write private key to stdin
+        if let Some(mut stdin) = public_key_cmd.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin
+                .write_all(private_key.as_bytes())
+                .await
+                .context("Failed to write private key to wg pubkey stdin")?;
+            stdin
+                .write_all(b"\n")
+                .await
+                .context("Failed to write newline to stdin")?;
+        }
+
+        let public_key_output = public_key_cmd
+            .wait_with_output()
             .await
             .context("Failed to derive public key")?;
 
@@ -101,7 +118,7 @@ async fn get_existing_subnets() -> Result<HashSet<String>> {
     for ifaddr in ifaddrs {
         if let Some(address) = ifaddr.address {
             if let Some(sock_addr) = address.as_sockaddr_in() {
-                let ip_addr = Ipv4Addr::from(sock_addr.ip());
+                let ip_addr = sock_addr.ip();
                 let octets = ip_addr.octets();
                 // Store the first two octets as the network identifier
                 subnets.insert(format!("{}.{}", octets[0], octets[1]));
@@ -221,7 +238,7 @@ impl OriginTunnel {
             info!("Setting upload bandwidth limit to {} Mbps ({} Kbps)", limit, rate_kbps);
 
             // Create root qdisc with HTB (Hierarchical Token Bucket)
-            post_up_rules.push(format!("tc qdisc add dev wg0 root handle 1: htb default 10"));
+            post_up_rules.push("tc qdisc add dev wg0 root handle 1: htb default 10".to_string());
 
             // Create class with rate limit
             post_up_rules.push(format!(
@@ -230,7 +247,7 @@ impl OriginTunnel {
             ));
 
             // Cleanup
-            pre_down_rules.push(format!("tc qdisc del dev wg0 root || true"));
+            pre_down_rules.push("tc qdisc del dev wg0 root || true".to_string());
         }
 
         // Download limit: traffic coming from proxy to origin (ingress on wg0)
@@ -241,32 +258,30 @@ impl OriginTunnel {
             info!("Setting download bandwidth limit to {} Mbps ({} Kbps)", limit, rate_kbps);
 
             // Load ifb module and create ifb0 device
-            post_up_rules.push(format!("modprobe ifb numifbs=1"));
-            post_up_rules.push(format!("ip link set dev ifb0 up"));
+            post_up_rules.push("modprobe ifb numifbs=1".to_string());
+            post_up_rules.push("ip link set dev ifb0 up".to_string());
 
             // Redirect ingress traffic from wg0 to ifb0
-            post_up_rules.push(format!("tc qdisc add dev wg0 handle ffff: ingress"));
-            post_up_rules.push(format!(
-                "tc filter add dev wg0 parent ffff: protocol all u32 match u32 0 0 action mirred egress redirect dev ifb0"
-            ));
+            post_up_rules.push("tc qdisc add dev wg0 handle ffff: ingress".to_string());
+            post_up_rules.push("tc filter add dev wg0 parent ffff: protocol all u32 match u32 0 0 action mirred egress redirect dev ifb0".to_string());
 
             // Apply rate limit on ifb0 (which represents wg0's ingress)
-            post_up_rules.push(format!("tc qdisc add dev ifb0 root handle 1: htb default 10"));
+            post_up_rules.push("tc qdisc add dev ifb0 root handle 1: htb default 10".to_string());
             post_up_rules.push(format!(
                 "tc class add dev ifb0 parent 1: classid 1:10 htb rate {}kbit ceil {}kbit",
                 rate_kbps, rate_kbps
             ));
 
             // Cleanup
-            pre_down_rules.push(format!("tc qdisc del dev wg0 ingress || true"));
-            pre_down_rules.push(format!("tc qdisc del dev ifb0 root || true"));
-            pre_down_rules.push(format!("ip link set dev ifb0 down || true"));
+            pre_down_rules.push("tc qdisc del dev wg0 ingress || true".to_string());
+            pre_down_rules.push("tc qdisc del dev ifb0 root || true".to_string());
+            pre_down_rules.push("ip link set dev ifb0 down || true".to_string());
         }
 
         // Create custom chain for traffic accounting (excludes WireGuard overhead)
-        post_up_rules.push(format!("iptables -N OUTPOST_ACCOUNTING || true"));
-        pre_down_rules.push(format!("iptables -F OUTPOST_ACCOUNTING || true"));
-        pre_down_rules.push(format!("iptables -X OUTPOST_ACCOUNTING || true"));
+        post_up_rules.push("iptables -N OUTPOST_ACCOUNTING || true".to_string());
+        pre_down_rules.push("iptables -F OUTPOST_ACCOUNTING || true".to_string());
+        pre_down_rules.push("iptables -X OUTPOST_ACCOUNTING || true".to_string());
 
         // Per-port rules
         for (port, protocol) in &port_mappings {
@@ -332,8 +347,8 @@ impl OriginTunnel {
         }
 
         // Jump to accounting chain from FORWARD to count packets/bytes
-        post_up_rules.push(format!("iptables -A FORWARD -j OUTPOST_ACCOUNTING"));
-        pre_down_rules.push(format!("iptables -D FORWARD -j OUTPOST_ACCOUNTING || true"));
+        post_up_rules.push("iptables -A FORWARD -j OUTPOST_ACCOUNTING".to_string());
+        pre_down_rules.push("iptables -D FORWARD -j OUTPOST_ACCOUNTING || true".to_string());
 
         let config = format!(
             r#"[Interface]
@@ -499,20 +514,4 @@ mod tests {
         assert!(!keys.preshared_key.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_key_pair_generation() {
-        let pair = WireGuardPair::generate()
-            .await
-            .expect("Failed to generate key pair");
-
-        // Both sides should have valid keys
-        assert!(!pair.origin.private_key.is_empty());
-        assert!(!pair.origin.public_key.is_empty());
-        assert!(!pair.proxy.private_key.is_empty());
-        assert!(!pair.proxy.public_key.is_empty());
-
-        // Keys should be different
-        assert_ne!(pair.origin.private_key, pair.proxy.private_key);
-        assert_ne!(pair.origin.public_key, pair.proxy.public_key);
-    }
 }

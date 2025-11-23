@@ -17,7 +17,7 @@ pub enum Protocol {
 }
 
 impl Protocol {
-    pub fn from_str(s: &str) -> Result<Self> {
+    pub fn parse(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
             "tcp" => Ok(Protocol::Tcp),
             "udp" => Ok(Protocol::Udp),
@@ -53,7 +53,7 @@ impl Endpoint {
         let url =
             url::Url::parse(s).with_context(|| format!("Failed to parse endpoint URL: {}", s))?;
 
-        let protocol = Protocol::from_str(url.scheme())?;
+        let protocol = Protocol::parse(url.scheme())?;
         let host = url
             .host_str()
             .with_context(|| format!("Missing host in endpoint URL: {}", s))?
@@ -183,7 +183,7 @@ impl Validate for CommandLine {
 
         // Validate upload_limit range
         if let Some(limit) = self.upload_limit {
-            if limit < 1 || limit > 10000 {
+            if !(1..=10000).contains(&limit) {
                 let mut error = validator::ValidationError::new("range");
                 error.message = Some("Upload limit must be between 1 and 10000 Mbps".into());
                 errors.add("upload_limit", error);
@@ -192,7 +192,7 @@ impl Validate for CommandLine {
 
         // Validate download_limit range
         if let Some(limit) = self.download_limit {
-            if limit < 1 || limit > 10000 {
+            if !(1..=10000).contains(&limit) {
                 let mut error = validator::ValidationError::new("range");
                 error.message = Some("Download limit must be between 1 and 10000 Mbps".into());
                 errors.add("download_limit", error);
@@ -387,7 +387,7 @@ impl ServiceConfig {
 }
 
 /// Custom validator for ingress list
-fn validate_ingress_list(ingress: &Vec<String>) -> Result<(), ValidationError> {
+fn validate_ingress_list(ingress: &[String]) -> Result<(), ValidationError> {
     if ingress.is_empty() {
         return Err(ValidationError::new(
             "At least one --ingress endpoint must be specified",

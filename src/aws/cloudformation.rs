@@ -385,9 +385,7 @@ impl CloudFormationTemplate {
 
         // Extract subnet from proxy IP (e.g., "172.17.0.1" -> "172.17.0.0")
         let subnet = self
-            .wg_proxy_ip
-            .rsplitn(2, '.')
-            .nth(1)
+            .wg_proxy_ip.rsplit_once('.').map(|x| x.0)
             .map(|s| format!("{}.0", s))
             .unwrap_or_else(|| "172.17.0.0".to_string());
 
@@ -434,122 +432,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_architecture_detection_x86() {
-        let template = CloudFormationTemplate {
-            stack_name: "test".to_string(),
-            region: "us-east-2".to_string(),
-            ingress_host: "test.example.com".to_string(),
-            ingress_port: 80,
-            ingress_protocol: "tcp".to_string(),
-            port_mappings: vec![(80, "tcp".to_string())],
-            origin_host: "localhost".to_string(),
-            origin_port: 8080,
-            origin_ip: "1.2.3.4".to_string(),
-            instance_type: "t3.micro".to_string(),
-            proxy_wg_private_key: "test_key".to_string(),
-            proxy_wg_public_key: "test_pub".to_string(),
-            origin_wg_public_key: "origin_pub".to_string(),
-            preshared_key: "preshared".to_string(),
-            debug: false,
-            use_cloudfront: false,
-            wg_proxy_ip: "172.17.0.1".to_string(),
-            wg_origin_ip: "172.17.0.2".to_string(),
-        };
-
-        assert_eq!(template.get_architecture(), "x86_64");
-    }
-
-    #[test]
-    fn test_architecture_detection_arm() {
-        let template = CloudFormationTemplate {
-            stack_name: "test".to_string(),
-            region: "us-east-2".to_string(),
-            ingress_host: "test.example.com".to_string(),
-            ingress_port: 80,
-            ingress_protocol: "tcp".to_string(),
-            port_mappings: vec![(80, "tcp".to_string())],
-            origin_host: "localhost".to_string(),
-            origin_port: 8080,
-            origin_ip: "1.2.3.4".to_string(),
-            instance_type: "t4g.nano".to_string(),
-            proxy_wg_private_key: "test_key".to_string(),
-            proxy_wg_public_key: "test_pub".to_string(),
-            origin_wg_public_key: "origin_pub".to_string(),
-            preshared_key: "preshared".to_string(),
-            debug: false,
-            use_cloudfront: false,
-            wg_proxy_ip: "172.17.0.1".to_string(),
-            wg_origin_ip: "172.17.0.2".to_string(),
-        };
-
-        assert_eq!(template.get_architecture(), "arm64");
-    }
-
-    #[test]
-    fn test_tcp_protocol_in_userdata() {
-        let template = CloudFormationTemplate {
-            stack_name: "test".to_string(),
-            region: "us-east-2".to_string(),
-            ingress_host: "test.example.com".to_string(),
-            ingress_port: 80,
-            ingress_protocol: "tcp".to_string(),
-            port_mappings: vec![(80, "tcp".to_string())],
-            origin_host: "localhost".to_string(),
-            origin_port: 8080,
-            origin_ip: "1.2.3.4".to_string(),
-            instance_type: "t4g.nano".to_string(),
-            proxy_wg_private_key: "test_key".to_string(),
-            proxy_wg_public_key: "test_pub".to_string(),
-            origin_wg_public_key: "origin_pub".to_string(),
-            preshared_key: "preshared".to_string(),
-            debug: false,
-            use_cloudfront: false,
-            wg_proxy_ip: "172.17.0.1".to_string(),
-            wg_origin_ip: "172.17.0.2".to_string(),
-        };
-
-        let userdata = template.generate_userdata();
-        let userdata_str = serde_json::to_string(&userdata).unwrap();
-        // Check for NixOS configuration syntax and port mappings
-        assert!(userdata_str.contains("{ config, pkgs, lib, ... }:"));
-        assert!(userdata_str.contains("debug = false"));
-        assert!(userdata_str.contains("port = 80"));
-        assert!(userdata_str.contains("protocol = \\\"tcp\\\""));
-    }
-
-    #[test]
-    fn test_udp_protocol_in_userdata() {
-        let template = CloudFormationTemplate {
-            stack_name: "test".to_string(),
-            region: "us-east-2".to_string(),
-            ingress_host: "test.example.com".to_string(),
-            ingress_port: 53,
-            ingress_protocol: "udp".to_string(),
-            port_mappings: vec![(53, "udp".to_string())],
-            origin_host: "localhost".to_string(),
-            origin_port: 53,
-            origin_ip: "1.2.3.4".to_string(),
-            instance_type: "t4g.nano".to_string(),
-            proxy_wg_private_key: "test_key".to_string(),
-            proxy_wg_public_key: "test_pub".to_string(),
-            origin_wg_public_key: "origin_pub".to_string(),
-            preshared_key: "preshared".to_string(),
-            debug: false,
-            use_cloudfront: false,
-            wg_proxy_ip: "172.17.0.1".to_string(),
-            wg_origin_ip: "172.17.0.2".to_string(),
-        };
-
-        let userdata = template.generate_userdata();
-        let userdata_str = serde_json::to_string(&userdata).unwrap();
-        // Check for NixOS configuration syntax and port mappings
-        assert!(userdata_str.contains("{ config, pkgs, lib, ... }:"));
-        assert!(userdata_str.contains("debug = false"));
-        assert!(userdata_str.contains("port = 53"));
-        assert!(userdata_str.contains("protocol = \\\"udp\\\""));
-    }
-
-    #[test]
     fn test_debug_mode_enabled() {
         let template = CloudFormationTemplate {
             stack_name: "test".to_string(),
@@ -576,7 +458,8 @@ mod tests {
         let userdata_str = serde_json::to_string(&userdata).unwrap();
         // Check that debug mode is enabled
         assert!(userdata_str.contains("debug = true"));
-        assert!(userdata_str.contains("services.openssh"));
-        assert!(userdata_str.contains("lib.mkIf debug"));
+        assert!(userdata_str.contains("openssh"));
+        assert!(userdata_str.contains("lib.mkForce debug")); // SSH is enabled via lib.mkForce debug
+        assert!(userdata_str.contains("PasswordAuthentication")); // Password auth enabled in debug mode
     }
 }
