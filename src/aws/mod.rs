@@ -158,6 +158,8 @@ impl AwsProxy {
         wg_proxy_ip: String,
         wg_origin_ip: String,
         port_mappings: Vec<(u16, String)>,
+        enable_tls: bool,
+        acme_email: Option<String>,
     ) -> Result<Self> {
         // Use the first region in the list, or fall back to defaults
         let region = regions
@@ -202,6 +204,13 @@ impl AwsProxy {
             use_cloudfront,
             wg_proxy_ip,
             wg_origin_ip,
+            enable_tls,
+            acme_domain: if enable_tls {
+                Some(ingress_host.clone())
+            } else {
+                None
+            },
+            acme_email,
         };
 
         let template_body = template.generate()?;

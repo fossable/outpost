@@ -148,6 +148,14 @@ pub enum ServiceConfig {
         /// Use CloudFront distribution (port 443 only)
         #[clap(long, env = "OUTPOST_AWS_USE_CLOUDFRONT")]
         use_cloudfront: bool,
+
+        /// Enable TLS termination with Let's Encrypt ACME
+        #[clap(long, env = "OUTPOST_AWS_ENABLE_TLS")]
+        enable_tls: bool,
+
+        /// Email for ACME certificate registration (required if --enable-tls is set)
+        #[clap(long, env = "OUTPOST_AWS_ACME_EMAIL")]
+        acme_email: Option<String>,
     },
 }
 
@@ -161,10 +169,16 @@ impl Validate for ServiceConfig {
                 // No specific validations for Cloudflare yet
             }
             #[cfg(feature = "aws")]
-            ServiceConfig::Aws { ingress, .. } => {
+            ServiceConfig::Aws { ingress, enable_tls, acme_email, .. } => {
                 // Validate ingress list
                 if let Err(e) = validate_ingress_list(ingress) {
                     errors.add("ingress", e);
+                }
+
+                // Validate ACME email is provided when TLS is enabled
+                if *enable_tls && acme_email.is_none() {
+                    errors.add("acme_email",
+                        validator::ValidationError::new("ACME email is required when --enable-tls is set"));
                 }
             }
         }

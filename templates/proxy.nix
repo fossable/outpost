@@ -2,22 +2,29 @@
 
 let
   debug = false; # Passing --debug will cause this to be enabled
+  enableTls = {ENABLE_TLS}; # Whether to enable TLS termination with ACME
+  acmeDomain = "{ACME_DOMAIN}"; # Domain name for ACME certificate
 
   # Port mappings: list of { port, protocol }
   portMappings = {PORT_MAPPINGS};
 
-  # Generate iptables rules for each port mapping
+  # Filter HTTPS port mappings for nginx TLS termination
+  httpsMapping = lib.findFirst (m: m.port == 443 && m.protocol == "tcp") null portMappings;
+
+  # Generate iptables rules for each port mapping (excluding 443 if TLS is enabled)
   generatePortForwardRules = mappings:
-    lib.concatMapStrings (m: ''
-      ${pkgs.iptables}/bin/iptables -t nat -A PREROUTING -p ${m.protocol} --dport ${toString m.port} -j DNAT --to-destination {ORIGIN_IP}:${toString m.port}
-      ${pkgs.iptables}/bin/iptables -t nat -A POSTROUTING -d {ORIGIN_IP}/32 -p ${m.protocol} --dport ${toString m.port} -j MASQUERADE
-    '') mappings;
+    lib.concatMapStrings (m:
+      lib.optionalString (!(enableTls && m.port == 443 && m.protocol == "tcp")) ''
+        ${pkgs.iptables}/bin/iptables -t nat -A PREROUTING -p ${m.protocol} --dport ${toString m.port} -j DNAT --to-destination {ORIGIN_IP}:${toString m.port}
+        ${pkgs.iptables}/bin/iptables -t nat -A POSTROUTING -d {ORIGIN_IP}/32 -p ${m.protocol} --dport ${toString m.port} -j MASQUERADE
+      '') mappings;
 
   generatePortForwardCleanup = mappings:
-    lib.concatMapStrings (m: ''
-      ${pkgs.iptables}/bin/iptables -t nat -D PREROUTING -p ${m.protocol} --dport ${toString m.port} -j DNAT --to-destination {ORIGIN_IP}:${toString m.port} || true
-      ${pkgs.iptables}/bin/iptables -t nat -D POSTROUTING -d {ORIGIN_IP}/32 -p ${m.protocol} --dport ${toString m.port} -j MASQUERADE || true
-    '') mappings;
+    lib.concatMapStrings (m:
+      lib.optionalString (!(enableTls && m.port == 443 && m.protocol == "tcp")) ''
+        ${pkgs.iptables}/bin/iptables -t nat -D PREROUTING -p ${m.protocol} --dport ${toString m.port} -j DNAT --to-destination {ORIGIN_IP}:${toString m.port} || true
+        ${pkgs.iptables}/bin/iptables -t nat -D POSTROUTING -d {ORIGIN_IP}/32 -p ${m.protocol} --dport ${toString m.port} -j MASQUERADE || true
+      '') mappings;
 
 in {
   imports = [ <nixpkgs/nixos/modules/virtualisation/amazon-image.nix> ];
@@ -35,6 +42,8 @@ in {
     iptables
     curl
     awscli2
+  ] ++ lib.optionals enableTls [
+    nginx
   ];
 
   # Don't install default packages
@@ -79,6 +88,35 @@ in {
       SystemMaxUse=100M
       MaxRetentionSec=1day
     '';
+
+    # Configure nginx for TLS termination
+    nginx = lib.mkIf enableTls {
+      enable = true;
+      recommendedTlsSettings = true;
+      recommendedOptimisation = true;
+      recommendedGzipSettings = true;
+      recommendedProxySettings = true;
+
+      virtualHosts."${acmeDomain}" = {
+        forceSSL = true;
+        enableACME = true;
+
+        locations."/" = {
+          proxyPass = "http://{ORIGIN_IP}:${toString (if httpsMapping != null then httpsMapping.port else 443)}";
+          proxyWebsockets = true;
+          extraConfig = ''
+            proxy_ssl_server_name on;
+            proxy_pass_header Authorization;
+          '';
+        };
+      };
+    };
+  };
+
+  # Configure ACME for Let's Encrypt certificates
+  security.acme = lib.mkIf enableTls {
+    acceptTerms = true;
+    defaults.email = "{ACME_EMAIL}";
   };
 
   users = {

@@ -179,6 +179,8 @@ async fn main() -> Result<ExitCode> {
             instance_type,
             debug,
             use_cloudfront,
+            enable_tls,
+            acme_email,
             ..
         } => {
             // Validate all configurations using validator crate
@@ -311,6 +313,8 @@ async fn main() -> Result<ExitCode> {
                     wg_proxy_ip.clone(),
                     wg_origin_ip.clone(),
                     port_mappings.clone(),
+                    *enable_tls,
+                    acme_email.clone(),
                 ) => result?,
                 _ = shutdown_rx2.recv() => {
                     info!("Shutdown signal received during deployment");

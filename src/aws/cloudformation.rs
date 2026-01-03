@@ -20,6 +20,9 @@ pub struct CloudFormationTemplate {
     pub use_cloudfront: bool,
     pub wg_proxy_ip: String,
     pub wg_origin_ip: String,
+    pub enable_tls: bool,
+    pub acme_domain: Option<String>,
+    pub acme_email: Option<String>,
 }
 
 impl CloudFormationTemplate {
@@ -337,6 +340,17 @@ impl CloudFormationTemplate {
             }),
         ];
 
+        // Add HTTP rule for ACME HTTP-01 challenge if TLS is enabled
+        if self.enable_tls {
+            rules.push(json!({
+                "IpProtocol": "tcp",
+                "FromPort": 80,
+                "ToPort": 80,
+                "CidrIp": "0.0.0.0/0",
+                "Description": "HTTP for ACME challenge"
+            }));
+        }
+
         // Add rules for each port mapping
         for (port, protocol) in &self.port_mappings {
             rules.push(json!({
@@ -413,6 +427,10 @@ impl CloudFormationTemplate {
                 "debug = false",
                 &format!("debug = {}", if self.debug { "true" } else { "false" }),
             )
+            .replace(
+                "enableTls = {ENABLE_TLS}",
+                &format!("enableTls = {}", if self.enable_tls { "true" } else { "false" }),
+            )
             .replace("{PROXY_WG_PRIVATE_KEY}", &self.proxy_wg_private_key)
             .replace("{PORT_MAPPINGS}", &port_mappings_nix)
             .replace("{ORIGIN_WG_PUBLIC_KEY}", &self.origin_wg_public_key)
@@ -421,7 +439,9 @@ impl CloudFormationTemplate {
             .replace("{PROXY_IP}", &self.wg_proxy_ip)
             .replace("{SUBNET}", &subnet)
             .replace("{STACK_NAME}", &self.stack_name)
-            .replace("{REGION}", &self.region);
+            .replace("{REGION}", &self.region)
+            .replace("{ACME_DOMAIN}", &self.acme_domain.clone().unwrap_or_default())
+            .replace("{ACME_EMAIL}", &self.acme_email.clone().unwrap_or_default());
 
         json!(nix_config)
     }
@@ -452,6 +472,9 @@ mod tests {
             use_cloudfront: false,
             wg_proxy_ip: "172.17.0.1".to_string(),
             wg_origin_ip: "172.17.0.2".to_string(),
+            enable_tls: false,
+            acme_domain: None,
+            acme_email: None,
         };
 
         let userdata = template.generate_userdata();
