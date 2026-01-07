@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/fossable/outpost/compare/v0.0.8...v0.0.9) - 2026-01-07
+
+### Other
+
+- update readme
+- enable ec2 proxy to terminate tls
+- address some clippy lints
+- improve bandwidth limiting
+- aws proxy finally works
+- initial cloudfront support
+- create AWS debugging mode
+- Relicense
+
 ## [0.0.8](https://github.com/fossable/outpost/compare/v0.0.7...v0.0.8) - 2024-06-30
 
 ### Other
