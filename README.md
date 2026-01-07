@@ -10,8 +10,25 @@
 <hr>
 
 **outpost** allows you to expose self-hosted web services to the Internet via
-popular cloud providers. Therefore it's possible to take advantage of some
-features of the cloud without getting locked in to any particular vendor.
+popular cloud providers without getting "locked in" to any particular cloud.
+
+## Why self-host?
+
+Cloud hosting has undeniable advantages over pure self hosting:
+
+- effectively infinite compute resources with extremely high reliability
+- low latency hosting in any geographic location
+- no blocked inbound ports by ISP
+- high upload speed
+
+To get these benefits, you give up some control of your applications. And, since
+your application likely depends on your cloud provider to varying degrees, you
+don't have the option to move to a different provider without some migration
+effort.
+
+Since it would be extremely costly to build a datacenter yourself, the easiest
+way is a hybrid approach. **outpost** sets up the provider-specific
+infrastructure which makes it simple to move to another cloud.
 
 ### Cloudflare
 
