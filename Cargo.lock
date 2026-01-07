@@ -1823,7 +1823,7 @@ checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
 
 [[package]]
 name = "outpost"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "askama",
